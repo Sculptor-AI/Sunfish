@@ -61,3 +61,9 @@ data/downloads/
 *.tmp
 *.temp
 .cache/
+
+# Data
+sunfish_demo_6k/
+sunfish_6k.onnx
+sunfish_demo_6k.zip
+ziH5GnLa
