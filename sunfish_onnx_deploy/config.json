@@ -1,0 +1,9 @@
+{
+  "n_embd": 512,
+  "vocab_size": 8192,
+  "timesteps": 500,
+  "beta_start": 0.0001,
+  "beta_end": 0.02,
+  "block_size": 256,
+  "tokenizer_name": "gpt2"
+}
