@@ -1,1 +1,0 @@
-onnxruntime>=1.15.0\nnumpy>=1.21.0\ntransformers>=4.30.0\ntqdm\n

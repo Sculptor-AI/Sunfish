@@ -1,16 +1,13 @@
 """SunFish configuration module."""
 
-from .model_config import SunFishConfig
-from .tiny_config import TinySunFishConfig, get_tiny_config
-from .micro_config import MicroSunFishConfig, get_micro_config
-from .nano_config import NanoSunFishConfig, get_nano_config
+from .qwen_masked_config import (
+    QwenMaskedDiffusionConfig,
+    get_qwen_masked_config,
+    get_qwen_masked_config_cpu,
+)
 
 __all__ = [
-    "SunFishConfig",
-    "TinySunFishConfig",
-    "get_tiny_config",
-    "MicroSunFishConfig",
-    "get_micro_config",
-    "NanoSunFishConfig",
-    "get_nano_config",
+    "QwenMaskedDiffusionConfig",
+    "get_qwen_masked_config",
+    "get_qwen_masked_config_cpu",
 ]

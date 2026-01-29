@@ -1,13 +1,17 @@
 """SunFish data module."""
 
-from .fineweb_datamodule import (
-    FineWebDataModule,
-    FineWebStreamDataset,
-    TinyTextDataset,
+from .qwen_datamodule import (
+    QwenDataModule,
+    QwenStreamDataset,
+    QwenCachedDataset,
+    QwenTextDataset,
+    SyntheticQwenDataset,
 )
 
 __all__ = [
-    "FineWebDataModule",
-    "FineWebStreamDataset",
-    "TinyTextDataset",
+    "QwenDataModule",
+    "QwenStreamDataset",
+    "QwenCachedDataset",
+    "QwenTextDataset",
+    "SyntheticQwenDataset",
 ]

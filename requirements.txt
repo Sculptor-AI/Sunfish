@@ -1,9 +1,10 @@
-# SunFish Diffusion LLM Dependencies
+# Sunfish Masked Diffusion Dependencies
 
 # Core ML frameworks
 torch>=2.1.0
 pytorch-lightning>=2.1.0
-transformers>=4.36.0
+transformers>=4.40.0  # Qwen3 support
+accelerate>=0.27.0    # Efficient model loading and gradient checkpointing
 
 # Data handling
 datasets>=2.16.0
@@ -13,10 +14,6 @@ tqdm>=4.66.0
 # Logging and experiment tracking
 wandb>=0.16.0
 tensorboard>=2.15.0
-
-# Utilities
-einops>=0.7.0
-pyyaml>=6.0
 
 # Development tools
 pytest>=7.4.0

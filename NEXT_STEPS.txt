@@ -1,0 +1,36 @@
+NEXT STEPS FOR SUNFISH TRAINING
+================================
+
+ISSUE: I was using the old checkpoint (last.ckpt from 50-step test), not your 1000-step run.
+
+1. FIND THE CORRECT CHECKPOINT
+   Run this to see all checkpoints with timestamps:
+
+   dir checkpoints\masked /O-D
+
+   Look for the most recent .ckpt file from your 1000-step run.
+
+2. TEST GENERATION WITH CORRECT CHECKPOINT
+   Replace [CHECKPOINT] with the actual filename:
+
+   python sample_masked.py checkpoints\masked\[CHECKPOINT] --num-samples 2 --seq-len 64 --num-steps 30
+
+3. IF OUTPUT IS STILL GARBAGE (expected at 1000 steps)
+   Train longer with wikitext-103 for better results:
+
+   python train_masked.py --dataset wikitext-103 --max-steps 5000 --batch-size 2 --accumulate 16
+
+   This will take ~30-40 minutes but should produce more coherent output.
+
+4. RESUME FROM EXISTING CHECKPOINT (optional)
+   If you want to continue training from your 1000-step checkpoint:
+
+   python train_masked.py --resume checkpoints\masked\[CHECKPOINT] --dataset wikitext-103 --max-steps 5000
+
+EXPECTED QUALITY BY TRAINING STEPS:
+- 1000 steps: Mostly garbage, some English words
+- 3000 steps: Short phrases, still choppy
+- 5000 steps: Coherent sentences starting to appear
+- 10000+ steps: Good quality for paper
+
+Let me know what the checkpoint situation looks like and we'll proceed from there.

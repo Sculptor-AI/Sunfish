@@ -63,8 +63,3 @@ data/downloads/
 .cache/
 
 # Data
-sunfish_demo_6k/
-sunfish_6k.onnx
-sunfish_demo_6k.zip
-ziH5GnLa
-sunfish_onnx_deploy/sunfish_model.onnx
