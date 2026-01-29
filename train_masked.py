@@ -156,6 +156,17 @@ def main():
         help="Force CPU training (for testing)",
     )
     parser.add_argument(
+        "--tpu",
+        action="store_true",
+        help="Use TPU (XLA) training",
+    )
+    parser.add_argument(
+        "--tpu-cores",
+        type=int,
+        default=8,
+        help="Number of TPU cores to use (default: 8)",
+    )
+    parser.add_argument(
         "--max-steps",
         type=int,
         default=None,
@@ -228,7 +239,15 @@ def main():
     args = parser.parse_args()
 
     # Load configuration
-    if args.cpu:
+    if args.tpu:
+        config = get_qwen_masked_config()
+        config.accelerator = "tpu"
+        config.devices = args.tpu_cores
+        config.precision = "bf16-mixed"
+        config.num_workers = 0
+        config.strategy = "auto"
+        print("Using TPU configuration")
+    elif args.cpu:
         config = get_qwen_masked_config_cpu()
         print("Using CPU configuration for testing")
     else:
@@ -236,7 +255,7 @@ def main():
         print("Using GPU configuration")
 
     # Improve Tensor Core utilization on NVIDIA GPUs
-    if not args.cpu and torch.cuda.is_available():
+    if not args.cpu and not args.tpu and torch.cuda.is_available():
         torch.set_float32_matmul_precision("high")
 
     # Apply overrides
