@@ -243,7 +243,7 @@ def main():
         config = get_qwen_masked_config()
         config.accelerator = "tpu"
         config.devices = "auto" if args.tpu_cores is None else int(args.tpu_cores)
-        config.precision = "bf16-mixed"
+        config.precision = "bf16-true"
         config.num_workers = 0
         config.strategy = "auto"
         print("Using TPU configuration")
