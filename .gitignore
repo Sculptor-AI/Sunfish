@@ -30,6 +30,7 @@ MANIFEST
 # Jupyter Notebook
 .ipynb_checkpoints
 *.ipynb
+!colab_train_masked.ipynb
 
 # Environments
 .env
