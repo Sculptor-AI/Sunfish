@@ -163,8 +163,8 @@ def main():
     parser.add_argument(
         "--tpu-cores",
         type=int,
-        default=8,
-        help="Number of TPU cores to use (default: 8)",
+        default=None,
+        help="Number of TPU cores to use (default: auto; Colab v5e often uses 1)",
     )
     parser.add_argument(
         "--max-steps",
@@ -242,7 +242,7 @@ def main():
     if args.tpu:
         config = get_qwen_masked_config()
         config.accelerator = "tpu"
-        config.devices = args.tpu_cores
+        config.devices = "auto" if args.tpu_cores is None else int(args.tpu_cores)
         config.precision = "bf16-mixed"
         config.num_workers = 0
         config.strategy = "auto"
