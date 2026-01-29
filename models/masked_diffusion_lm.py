@@ -165,8 +165,7 @@ class MaskedDiffusionLM(pl.LightningModule):
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
 
-        # Build a non-causal attention mask mapping for Qwen3.
-        # Qwen3Model treats a dict as a pre-built mask mapping and skips causal mask creation.
+        # Build a non-causal attention mask.
         if attention_mask is None:
             full_mask = torch.zeros(
                 batch_size, 1, seq_len, seq_len,
@@ -183,14 +182,10 @@ class MaskedDiffusionLM(pl.LightningModule):
             full_mask = (1.0 - keep) * neg_inf
             full_mask = full_mask.expand(batch_size, 1, seq_len, seq_len)
 
-        # Build mask mapping keyed by layer type
-        layer_types = getattr(self.model.config, "layer_types", ["full_attention"])
-        mask_mapping = {layer_type: full_mask for layer_type in set(layer_types)}
-
-        # Forward through model with explicit bidirectional attention mask mapping
+        # Forward through model with explicit bidirectional attention mask
         outputs = self.model(
             input_ids=input_ids,
-            attention_mask=mask_mapping,
+            attention_mask=full_mask,
             output_hidden_states=True,
             use_cache=False,  # Disable KV cache for bidirectional
         )
