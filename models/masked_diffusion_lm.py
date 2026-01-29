@@ -167,10 +167,12 @@ class MaskedDiffusionLM(pl.LightningModule):
 
         # Build a non-causal attention mask mapping for Qwen3.
         # Qwen3Model treats a dict as a pre-built mask mapping and skips causal mask creation.
+        # Use float32 masks to satisfy XLA/SDPA dtype requirements.
+        mask_dtype = torch.float32
         if attention_mask is None:
             full_mask = torch.zeros(
                 batch_size, 1, seq_len, seq_len,
-                dtype=self.model.dtype,
+                dtype=mask_dtype,
                 device=device,
             )
         else:
@@ -178,8 +180,8 @@ class MaskedDiffusionLM(pl.LightningModule):
             # Convert to additive mask: 0 for keep, -inf for pad
             if attention_mask.dim() != 2:
                 raise ValueError("attention_mask must be 2D [batch, seq]")
-            keep = attention_mask[:, None, None, :].to(dtype=self.model.dtype, device=device)
-            neg_inf = torch.finfo(self.model.dtype).min
+            keep = attention_mask[:, None, None, :].to(dtype=mask_dtype, device=device)
+            neg_inf = torch.finfo(mask_dtype).min
             full_mask = (1.0 - keep) * neg_inf
             full_mask = full_mask.expand(batch_size, 1, seq_len, seq_len)
 
