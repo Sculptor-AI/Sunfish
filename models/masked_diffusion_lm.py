@@ -123,6 +123,15 @@ class MaskedDiffusionLM(pl.LightningModule):
         else:
             return t.float() / self.config.timesteps
 
+    def _get_move_chance(self, t_float: torch.Tensor) -> torch.Tensor:
+        """Masking probability at normalized time t in [0, 1] (for sampling).
+
+        t=0 means clean (no masking), t=1 means fully masked.
+        """
+        if self.config.mask_schedule == "cosine":
+            return 1.0 - torch.cos(t_float * math.pi / 2)
+        return t_float
+
     def forward_mask(self, token_ids: torch.Tensor, t: torch.Tensor):
         """
         Apply masking at timestep t.
@@ -167,8 +176,10 @@ class MaskedDiffusionLM(pl.LightningModule):
 
         # Build a non-causal attention mask mapping for Qwen3.
         # Qwen3Model treats a dict as a pre-built mask mapping and skips causal mask creation.
-        # Use float32 masks to satisfy XLA/SDPA dtype requirements.
-        mask_dtype = torch.float32
+        # Additive mask in model dtype: 0 = attend, -inf = ignore.
+        mask_dtype = next(self.parameters()).dtype
+        if not mask_dtype.is_floating_point:
+            mask_dtype = torch.float32
         if attention_mask is None:
             full_mask = torch.zeros(
                 batch_size, 1, seq_len, seq_len,
@@ -177,12 +188,10 @@ class MaskedDiffusionLM(pl.LightningModule):
             )
         else:
             # attention_mask is [batch, seq] with 1 for tokens to keep, 0 for padding
-            # Convert to additive mask: 0 for keep, -inf for pad
             if attention_mask.dim() != 2:
                 raise ValueError("attention_mask must be 2D [batch, seq]")
             keep = attention_mask[:, None, None, :].to(dtype=mask_dtype, device=device)
-            neg_inf = torch.finfo(mask_dtype).min
-            full_mask = (1.0 - keep) * neg_inf
+            full_mask = (1.0 - keep) * torch.finfo(mask_dtype).min
             full_mask = full_mask.expand(batch_size, 1, seq_len, seq_len)
 
         # Build mask mapping keyed by layer type
@@ -397,12 +406,12 @@ class MaskedDiffusionLM(pl.LightningModule):
         top_p: float = 0.9,
     ):
         """
-        Generate text using iterative unmasking.
+        Generate text using MDLM ancestral posterior sampling.
 
         Args:
             batch_size: Number of sequences to generate
             seq_len: Length of sequences
-            num_steps: Number of unmasking steps
+            num_steps: Number of reverse diffusion steps
             temperature: Sampling temperature
             top_k: Top-k filtering
             top_p: Top-p (nucleus) filtering
@@ -412,74 +421,64 @@ class MaskedDiffusionLM(pl.LightningModule):
         """
         device = next(self.parameters()).device
 
-        # Start fully masked
         tokens = torch.full(
             (batch_size, seq_len),
             self.mask_token_id,
             dtype=torch.long,
             device=device,
         )
-        is_masked = torch.ones(batch_size, seq_len, dtype=torch.bool, device=device)
 
-        for step in range(num_steps):
-            # Get predictions
-            logits = self.forward(tokens) / temperature  # [batch, seq, vocab]
+        eps = 1e-4
+        timesteps = torch.linspace(1.0, eps, num_steps + 1, device=device)
 
-            # Apply top-k filtering
+        for i in range(num_steps):
+            t = timesteps[i]
+            s = timesteps[i + 1]
+            move_chance_t = self._get_move_chance(t)
+            move_chance_s = self._get_move_chance(s)
+
+            logits = self.forward(tokens) / temperature
+            logits[..., self.mask_token_id] = float("-inf")
+
             if top_k > 0:
-                indices_to_remove = logits < torch.topk(logits, top_k, dim=-1).values[..., -1:]
+                indices_to_remove = (
+                    logits < torch.topk(logits, top_k, dim=-1).values[..., -1:]
+                )
                 logits[indices_to_remove] = float("-inf")
 
-            # Apply top-p filtering
             if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_logits, sorted_indices = torch.sort(
+                    logits, descending=True, dim=-1
+                )
+                cumulative_probs = torch.cumsum(
+                    F.softmax(sorted_logits, dim=-1), dim=-1
+                )
                 sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
+                    ..., :-1
+                ].clone()
                 sorted_indices_to_remove[..., 0] = False
-                indices_to_remove = sorted_indices_to_remove.scatter(-1, sorted_indices, sorted_indices_to_remove)
+                indices_to_remove = sorted_indices_to_remove.scatter(
+                    -1, sorted_indices, sorted_indices_to_remove
+                )
                 logits[indices_to_remove] = float("-inf")
 
-            # Sample tokens
-            probs = F.softmax(logits, dim=-1)
-            sampled = torch.multinomial(
-                probs.view(-1, self.vocab_size),
-                num_samples=1,
-            ).view(batch_size, -1)
+            p_x0 = F.softmax(logits, dim=-1).to(torch.float64)
+            q_xs = p_x0 * (move_chance_t - move_chance_s)
+            q_xs[..., self.mask_token_id] = move_chance_s
 
-            # Confidence scores for masked positions
-            confidence = probs.max(dim=-1).values  # [batch, seq]
-            confidence[~is_masked] = -1  # Don't re-unmask
+            gumbel_norm = 1e-10 - (torch.rand_like(q_xs) + 1e-10).log()
+            sampled = (q_xs / gumbel_norm).argmax(dim=-1)
 
-            # Calculate how many to unmask this step
-            remaining_steps = num_steps - step
-            remaining_masked = is_masked.sum().item()
-            num_to_unmask = max(1, remaining_masked // remaining_steps)
+            is_masked = tokens == self.mask_token_id
+            tokens = torch.where(is_masked, sampled, tokens)
 
-            # Find top confident positions across batch
-            flat_confidence = confidence.view(-1)
-            flat_is_masked = is_masked.view(-1)
-
-            # Only consider masked positions
-            masked_indices = flat_is_masked.nonzero(as_tuple=True)[0]
-            if len(masked_indices) == 0:
-                break
-
-            masked_confidences = flat_confidence[masked_indices]
-            num_to_unmask = min(num_to_unmask, len(masked_indices))
-
-            _, top_indices = masked_confidences.topk(num_to_unmask)
-            unmask_indices = masked_indices[top_indices]
-
-            # Update tokens and mask
-            flat_tokens = tokens.view(-1)
-            flat_sampled = sampled.view(-1)
-
-            flat_tokens[unmask_indices] = flat_sampled[unmask_indices]
-            flat_is_masked[unmask_indices] = False
-
-            tokens = flat_tokens.view(batch_size, -1)
-            is_masked = flat_is_masked.view(batch_size, -1)
+        still_masked = tokens == self.mask_token_id
+        if still_masked.any():
+            logits = self.forward(tokens)
+            logits[..., self.mask_token_id] = float("-inf")
+            final_preds = logits.argmax(dim=-1)
+            tokens = torch.where(still_masked, final_preds, tokens)
 
         return tokens
 

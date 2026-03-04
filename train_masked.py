@@ -30,7 +30,7 @@ def setup_callbacks(config, overwrite_last: bool = False):
         dirpath="checkpoints/masked/",
         filename="masked-diffusion-{epoch:02d}-{step}",
         save_top_k=config.save_top_k,
-        monitor="train_loss",
+        monitor="val_loss",
         mode="min",
         every_n_train_steps=config.checkpoint_every_n_steps,
         save_last=True,
@@ -303,7 +303,6 @@ def main():
     strategy = setup_strategy(config)
 
     # Initialize trainer
-    # Note: val_check_interval might be larger than training data, so use None for epoch-based validation
     trainer = pl.Trainer(
         accelerator=config.accelerator,
         devices="auto" if config.devices == "auto" else int(config.devices),
@@ -315,8 +314,8 @@ def main():
         accumulate_grad_batches=config.accumulate_grad_batches,
         gradient_clip_val=config.gradient_clip_val,
         log_every_n_steps=config.log_every_n_steps,
-        val_check_interval=None,  # Validate at end of each epoch (safer for small datasets)
-        check_val_every_n_epoch=1,
+        val_check_interval=config.val_check_interval,
+        limit_val_batches=50,
         enable_checkpointing=True,
         deterministic=False,
         enable_progress_bar=True,

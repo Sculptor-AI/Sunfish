@@ -1,20 +1,46 @@
 """
 Discrete Diffusion Sampler
-Implements iterative unmasking for text generation.
+Implements MDLM ancestral posterior sampling for text generation.
 """
 
+import math
 import torch
 import torch.nn.functional as F
 from typing import Optional, Callable
 from tqdm import tqdm
 
 
+def _sample_categorical(categorical_probs):
+    """Sample from a categorical distribution via the Gumbel-max trick.
+
+    Works with unnormalized probabilities. Matching the reference at
+    https://github.com/kuleshov-group/mdlm (diffusion.py).
+    """
+    gumbel_norm = (
+        1e-10
+        - (torch.rand_like(categorical_probs) + 1e-10).log()
+    )
+    return (categorical_probs / gumbel_norm).argmax(dim=-1)
+
+
+def _get_move_chance(t, schedule="linear"):
+    """Masking probability at normalized time t in [0, 1].
+
+    t=0 -> clean (no masking), t=1 -> fully masked.
+    """
+    if schedule == "cosine":
+        return 1.0 - torch.cos(t * math.pi / 2)
+    return t
+
+
 class DiscreteDiffusionSampler:
     """
     Sampler for discrete masked diffusion models.
 
-    Implements iterative unmasking where tokens are revealed
-    based on model confidence, starting from a fully masked sequence.
+    Uses MDLM ancestral posterior sampling: at each reverse step,
+    every masked position independently decides whether to unmask
+    based on the diffusion schedule, rather than a confidence-based
+    heuristic.
     """
 
     def __init__(self, model):
@@ -25,6 +51,7 @@ class DiscreteDiffusionSampler:
         self.model = model
         self.mask_token_id = model.mask_token_id
         self.vocab_size = model.vocab_size
+        self.mask_schedule = getattr(model.config, "mask_schedule", "linear")
 
     @torch.no_grad()
     def sample(
@@ -39,32 +66,28 @@ class DiscreteDiffusionSampler:
         prefix_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Generate samples using iterative unmasking.
+        Generate samples via MDLM ancestral posterior sampling.
 
-        Algorithm:
-        1. Start with fully masked sequence (or prefix + masked)
-        2. For each step:
-           - Get model predictions for all positions
-           - Sample tokens from predicted distribution
-           - Unmask positions with highest confidence
-        3. Return final tokens
+        At each step from t (more masked) to s (less masked), every masked
+        position samples from the posterior: stay masked with probability
+        proportional to move_chance_s, or unmask to a predicted token with
+        probability proportional to p_x0 * (move_chance_t - move_chance_s).
 
         Args:
             batch_size: Number of sequences to generate
             seq_len: Length of sequences to generate
-            num_steps: Number of unmasking steps
-            temperature: Sampling temperature (higher = more random)
+            num_steps: Number of reverse diffusion steps
+            temperature: Sampling temperature (applied to model logits)
             top_k: Top-k filtering (0 = disabled)
             top_p: Top-p (nucleus) filtering (1.0 = disabled)
             show_progress: Show progress bar
             prefix_ids: Optional prefix tokens [batch, prefix_len] to condition on
 
         Returns:
-            tokens: [batch_size, seq_len] - generated token IDs
+            tokens: [batch_size, seq_len] generated token IDs
         """
         device = next(self.model.parameters()).device
 
-        # Initialize with masked tokens
         tokens = torch.full(
             (batch_size, seq_len),
             self.mask_token_id,
@@ -72,10 +95,6 @@ class DiscreteDiffusionSampler:
             device=device,
         )
 
-        # Track which positions are still masked
-        is_masked = torch.ones(batch_size, seq_len, dtype=torch.bool, device=device)
-
-        # Handle prefix conditioning
         if prefix_ids is not None:
             if prefix_ids.shape[0] != batch_size:
                 raise ValueError("prefix_ids batch size must match batch_size")
@@ -83,85 +102,32 @@ class DiscreteDiffusionSampler:
             if prefix_len > seq_len:
                 raise ValueError("prefix_ids length must be <= seq_len")
             tokens[:, :prefix_len] = prefix_ids
-            is_masked[:, :prefix_len] = False
 
-        # Calculate unmasking schedule
-        total_to_unmask = is_masked.sum().item()
-        unmask_per_step = max(1, total_to_unmask // num_steps)
+        eps = 1e-4
+        timesteps = torch.linspace(1.0, eps, num_steps + 1, device=device)
 
         iterator = range(num_steps)
         if show_progress:
             iterator = tqdm(iterator, desc="Generating", leave=False)
 
-        for step in iterator:
-            # Skip if nothing left to unmask
-            if not is_masked.any():
-                break
+        for i in iterator:
+            t = timesteps[i]
+            s = timesteps[i + 1]
+            move_chance_t = _get_move_chance(t, self.mask_schedule)
+            move_chance_s = _get_move_chance(s, self.mask_schedule)
 
-            # Get model predictions
-            logits = self.model.forward(tokens)  # [batch, seq, vocab]
+            logits = self._get_model_logits(tokens, temperature, top_k, top_p)
+            p_x0 = F.softmax(logits, dim=-1).to(torch.float64)
 
-            # Apply temperature
-            logits = logits / temperature
+            q_xs = p_x0 * (move_chance_t - move_chance_s)
+            q_xs[..., self.mask_token_id] = move_chance_s
 
-            # Prevent sampling the [MASK] token
-            if self.mask_token_id is not None:
-                logits[..., self.mask_token_id] = float("-inf")
+            sampled = _sample_categorical(q_xs)
 
-            # Apply top-k filtering
-            if top_k > 0:
-                logits = self._top_k_filtering(logits, top_k)
+            is_masked = tokens == self.mask_token_id
+            tokens = torch.where(is_masked, sampled, tokens)
 
-            # Apply top-p (nucleus) filtering
-            if top_p < 1.0:
-                logits = self._top_p_filtering(logits, top_p)
-
-            # Get probabilities and sample
-            probs = F.softmax(logits, dim=-1)
-            sampled = torch.multinomial(
-                probs.view(-1, self.vocab_size),
-                num_samples=1,
-            ).view(batch_size, seq_len)
-
-            # Get confidence for each position (max probability)
-            confidence = probs.max(dim=-1).values  # [batch, seq]
-
-            # Zero out confidence for already-unmasked positions
-            confidence = confidence * is_masked.float()
-
-            # Determine how many to unmask this step
-            remaining_steps = num_steps - step
-            remaining_masked = is_masked.sum().item()
-            num_to_unmask = max(1, remaining_masked // remaining_steps)
-
-            # Find most confident positions to unmask
-            flat_confidence = confidence.view(-1)
-            flat_is_masked = is_masked.view(-1)
-
-            # Get indices of masked positions
-            masked_indices = flat_is_masked.nonzero(as_tuple=True)[0]
-            if len(masked_indices) == 0:
-                break
-
-            # Select top confident among masked
-            masked_confidences = flat_confidence[masked_indices]
-            num_to_unmask = min(num_to_unmask, len(masked_indices))
-
-            _, top_relative_indices = masked_confidences.topk(num_to_unmask)
-            unmask_indices = masked_indices[top_relative_indices]
-
-            # Update tokens at selected positions
-            flat_tokens = tokens.view(-1)
-            flat_sampled = sampled.view(-1)
-            flat_tokens[unmask_indices] = flat_sampled[unmask_indices]
-
-            # Update mask
-            flat_is_masked[unmask_indices] = False
-
-            # Reshape back
-            tokens = flat_tokens.view(batch_size, seq_len)
-            is_masked = flat_is_masked.view(batch_size, seq_len)
-
+        self._final_denoise(tokens)
         return tokens
 
     @torch.no_grad()
@@ -177,7 +143,7 @@ class DiscreteDiffusionSampler:
         show_progress: bool = True,
     ) -> torch.Tensor:
         """
-        Generate with optional guidance function.
+        Generate with optional guidance function using posterior sampling.
 
         The guidance function takes logits and returns modified logits,
         allowing for controlled generation.
@@ -185,7 +151,7 @@ class DiscreteDiffusionSampler:
         Args:
             batch_size: Number of sequences
             seq_len: Sequence length
-            num_steps: Unmasking steps
+            num_steps: Reverse diffusion steps
             temperature: Sampling temperature
             top_k: Top-k filtering
             guidance_fn: Function(logits, tokens, step) -> modified logits
@@ -203,62 +169,41 @@ class DiscreteDiffusionSampler:
             dtype=torch.long,
             device=device,
         )
-        is_masked = torch.ones(batch_size, seq_len, dtype=torch.bool, device=device)
+
+        eps = 1e-4
+        timesteps = torch.linspace(1.0, eps, num_steps + 1, device=device)
 
         iterator = range(num_steps)
         if show_progress:
             iterator = tqdm(iterator, desc="Guided generation", leave=False)
 
-        for step in iterator:
-            if not is_masked.any():
-                break
+        for i in iterator:
+            t = timesteps[i]
+            s = timesteps[i + 1]
+            move_chance_t = _get_move_chance(t, self.mask_schedule)
+            move_chance_s = _get_move_chance(s, self.mask_schedule)
 
             logits = self.model.forward(tokens) / temperature
-
             if self.mask_token_id is not None:
                 logits[..., self.mask_token_id] = float("-inf")
 
-            # Apply guidance if provided
             if guidance_fn is not None:
-                guided_logits = guidance_fn(logits, tokens, step)
+                guided_logits = guidance_fn(logits, tokens, i)
                 logits = logits + guidance_scale * (guided_logits - logits)
 
             if top_k > 0:
                 logits = self._top_k_filtering(logits, top_k)
 
-            probs = F.softmax(logits, dim=-1)
-            sampled = torch.multinomial(
-                probs.view(-1, self.vocab_size),
-                num_samples=1,
-            ).view(batch_size, seq_len)
+            p_x0 = F.softmax(logits, dim=-1).to(torch.float64)
+            q_xs = p_x0 * (move_chance_t - move_chance_s)
+            q_xs[..., self.mask_token_id] = move_chance_s
 
-            confidence = probs.max(dim=-1).values * is_masked.float()
+            sampled = _sample_categorical(q_xs)
 
-            remaining_steps = num_steps - step
-            remaining_masked = is_masked.sum().item()
-            num_to_unmask = max(1, remaining_masked // remaining_steps)
+            is_masked = tokens == self.mask_token_id
+            tokens = torch.where(is_masked, sampled, tokens)
 
-            flat_confidence = confidence.view(-1)
-            flat_is_masked = is_masked.view(-1)
-            masked_indices = flat_is_masked.nonzero(as_tuple=True)[0]
-
-            if len(masked_indices) == 0:
-                break
-
-            masked_confidences = flat_confidence[masked_indices]
-            num_to_unmask = min(num_to_unmask, len(masked_indices))
-
-            _, top_relative_indices = masked_confidences.topk(num_to_unmask)
-            unmask_indices = masked_indices[top_relative_indices]
-
-            flat_tokens = tokens.view(-1)
-            flat_sampled = sampled.view(-1)
-            flat_tokens[unmask_indices] = flat_sampled[unmask_indices]
-            flat_is_masked[unmask_indices] = False
-
-            tokens = flat_tokens.view(batch_size, seq_len)
-            is_masked = flat_is_masked.view(batch_size, seq_len)
-
+        self._final_denoise(tokens)
         return tokens
 
     @torch.no_grad()
@@ -273,13 +218,16 @@ class DiscreteDiffusionSampler:
         show_progress: bool = True,
     ) -> torch.Tensor:
         """
-        Infill between prefix and suffix.
+        Infill between prefix and suffix using posterior sampling.
+
+        Prefix and suffix positions are never masked, so the carry-over
+        property of the reverse process preserves them automatically.
 
         Args:
             prefix_ids: [batch, prefix_len] - tokens before infill
             suffix_ids: [batch, suffix_len] - tokens after infill
             infill_len: Number of tokens to generate in middle
-            num_steps: Unmasking steps
+            num_steps: Reverse diffusion steps
             temperature: Sampling temperature
             top_k: Top-k filtering
             show_progress: Show progress bar
@@ -293,7 +241,6 @@ class DiscreteDiffusionSampler:
         suffix_len = suffix_ids.shape[1]
         total_len = prefix_len + infill_len + suffix_len
 
-        # Initialize sequence
         tokens = torch.full(
             (batch_size, total_len),
             self.mask_token_id,
@@ -303,60 +250,60 @@ class DiscreteDiffusionSampler:
         tokens[:, :prefix_len] = prefix_ids
         tokens[:, prefix_len + infill_len:] = suffix_ids
 
-        # Only infill middle is masked
-        is_masked = torch.zeros(batch_size, total_len, dtype=torch.bool, device=device)
-        is_masked[:, prefix_len:prefix_len + infill_len] = True
+        eps = 1e-4
+        timesteps = torch.linspace(1.0, eps, num_steps + 1, device=device)
 
         iterator = range(num_steps)
         if show_progress:
             iterator = tqdm(iterator, desc="Infilling", leave=False)
 
-        for step in iterator:
-            if not is_masked.any():
-                break
+        for i in iterator:
+            t = timesteps[i]
+            s = timesteps[i + 1]
+            move_chance_t = _get_move_chance(t, self.mask_schedule)
+            move_chance_s = _get_move_chance(s, self.mask_schedule)
 
-            logits = self.model.forward(tokens) / temperature
+            logits = self._get_model_logits(tokens, temperature, top_k, 1.0)
+            p_x0 = F.softmax(logits, dim=-1).to(torch.float64)
 
-            if self.mask_token_id is not None:
-                logits[..., self.mask_token_id] = float("-inf")
+            q_xs = p_x0 * (move_chance_t - move_chance_s)
+            q_xs[..., self.mask_token_id] = move_chance_s
 
-            if top_k > 0:
-                logits = self._top_k_filtering(logits, top_k)
+            sampled = _sample_categorical(q_xs)
 
-            probs = F.softmax(logits, dim=-1)
-            sampled = torch.multinomial(
-                probs.view(-1, self.vocab_size),
-                num_samples=1,
-            ).view(batch_size, total_len)
+            is_masked = tokens == self.mask_token_id
+            tokens = torch.where(is_masked, sampled, tokens)
 
-            confidence = probs.max(dim=-1).values * is_masked.float()
-
-            remaining_steps = num_steps - step
-            remaining_masked = is_masked.sum().item()
-            num_to_unmask = max(1, remaining_masked // remaining_steps)
-
-            flat_confidence = confidence.view(-1)
-            flat_is_masked = is_masked.view(-1)
-            masked_indices = flat_is_masked.nonzero(as_tuple=True)[0]
-
-            if len(masked_indices) == 0:
-                break
-
-            masked_confidences = flat_confidence[masked_indices]
-            num_to_unmask = min(num_to_unmask, len(masked_indices))
-
-            _, top_relative_indices = masked_confidences.topk(num_to_unmask)
-            unmask_indices = masked_indices[top_relative_indices]
-
-            flat_tokens = tokens.view(-1)
-            flat_sampled = sampled.view(-1)
-            flat_tokens[unmask_indices] = flat_sampled[unmask_indices]
-            flat_is_masked[unmask_indices] = False
-
-            tokens = flat_tokens.view(batch_size, total_len)
-            is_masked = flat_is_masked.view(batch_size, total_len)
-
+        self._final_denoise(tokens)
         return tokens
+
+    def _get_model_logits(
+        self,
+        tokens: torch.Tensor,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+    ) -> torch.Tensor:
+        """Get filtered model logits with [MASK] logit zeroed."""
+        logits = self.model.forward(tokens) / temperature
+        if self.mask_token_id is not None:
+            logits[..., self.mask_token_id] = float("-inf")
+        if top_k > 0:
+            logits = self._top_k_filtering(logits, top_k)
+        if top_p < 1.0:
+            logits = self._top_p_filtering(logits, top_p)
+        return logits
+
+    def _final_denoise(self, tokens: torch.Tensor) -> None:
+        """Replace any remaining [MASK] tokens with argmax predictions."""
+        still_masked = tokens == self.mask_token_id
+        if not still_masked.any():
+            return
+        logits = self.model.forward(tokens)
+        if self.mask_token_id is not None:
+            logits[..., self.mask_token_id] = float("-inf")
+        final_preds = logits.argmax(dim=-1)
+        tokens[still_masked] = final_preds[still_masked]
 
     def _top_k_filtering(self, logits: torch.Tensor, top_k: int) -> torch.Tensor:
         """Apply top-k filtering to logits."""
@@ -370,14 +317,13 @@ class DiscreteDiffusionSampler:
         sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
         cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
 
-        # Remove tokens with cumulative probability above threshold
         sorted_indices_to_remove = cumulative_probs > top_p
-        # Shift to keep first token above threshold
         sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
         sorted_indices_to_remove[..., 0] = False
 
-        # Scatter back
-        indices_to_remove = sorted_indices_to_remove.scatter(-1, sorted_indices, sorted_indices_to_remove)
+        indices_to_remove = sorted_indices_to_remove.scatter(
+            -1, sorted_indices, sorted_indices_to_remove
+        )
         logits = logits.clone()
         logits[indices_to_remove] = float("-inf")
         return logits
@@ -386,6 +332,6 @@ class DiscreteDiffusionSampler:
 if __name__ == "__main__":
     print("DiscreteDiffusionSampler module loaded successfully!")
     print("\nFeatures:")
-    print("  - sample(): Basic iterative unmasking")
-    print("  - sample_with_guidance(): Controlled generation")
+    print("  - sample(): MDLM posterior sampling with iterative unmasking")
+    print("  - sample_with_guidance(): Controlled generation with guidance")
     print("  - infill(): Fill in between prefix and suffix")
