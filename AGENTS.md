@@ -24,6 +24,11 @@ before starting anything that overlaps.
 4. Don't rename each other's public APIs without a note here first.
 5. Parameter/gate numbers come from `reference/upstream/audit.json` (real
    audited shard headers), not from design estimates.
+6. **Chase's laptop is not a compute node** (his rule, 2026-07-11). Local
+   machine: edits, unit tests, small verifications. Anything heavy — bulk
+   tokenization, large hashing, corpus assembly at scale, model forwards —
+   goes to Colab/Kaggle (`infra/colab/sunfish_heavy_jobs.ipynb`) or the TPU
+   VM once allocated. Don't schedule multi-GB local jobs without asking.
 
 ## Fresh, load-bearing findings (Claude, 2026-07-10)
 

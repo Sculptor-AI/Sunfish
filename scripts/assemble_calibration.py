@@ -84,13 +84,6 @@ SOURCES = {
 }
 
 
-def pack_tokens(token_ids: list[int]) -> bytes:
-    """uint32 little-endian packing (262K vocab exceeds uint16)."""
-    import struct
-
-    return struct.pack(f"<{len(token_ids)}I", *token_ids)
-
-
 def assemble_bucket(
     name: str,
     spec: dict,
@@ -99,7 +92,16 @@ def assemble_bucket(
     token_cap: int,
     min_doc_tokens: int = 16,
 ) -> dict:
+    """Stream, tokenize, and write one bucket as an indexed immutable shard.
+
+    Uses sunfish.datashards ShardWriter (.bin/.idx) so every document is a
+    randomly-accessible record — required by the process-disjoint sampler and
+    the calibration hook. One shard per bucket; bucket identity lives in the
+    manifest entry, not inside records.
+    """
     from datasets import load_dataset
+
+    from sunfish.datashards import ShardWriter
 
     dataset_id, config, split = spec["dataset"]
     build = spec["build"]
@@ -109,30 +111,24 @@ def assemble_bucket(
     else:
         stream = load_dataset(dataset_id, config, split=split, streaming=True)
 
-    out_path = output_dir / f"{name}.bin"
-    total_tokens = 0
-    documents = 0
-    with out_path.open("wb") as handle:
-        for example in stream:
-            text = build(example)
-            if not text or not text.strip():
-                continue
-            ids = tokenizer.encode(text).ids
-            if len(ids) < min_doc_tokens:
-                continue
-            handle.write(pack_tokens(ids))
-            total_tokens += len(ids)
-            documents += 1
-            if total_tokens >= token_cap:
-                break
+    writer = ShardWriter(output_dir / name)
+    for example in stream:
+        text = build(example)
+        if not text or not text.strip():
+            continue
+        ids = tokenizer.encode(text).ids
+        if len(ids) < min_doc_tokens:
+            continue
+        writer.add(ids)
+        if writer.tokens >= token_cap:
+            break
+    info = writer.close()
     return {
         "bucket": name,
         "dataset": dataset_id,
         "config": config,
-        "tokens": total_tokens,
-        "documents": documents,
-        "file": out_path.name,
         "seconds": round(time.time() - started, 1),
+        **info,
     }
 
 
@@ -144,7 +140,12 @@ def main() -> None:
     parser.add_argument("--buckets", nargs="*", help="subset of buckets to build")
     args = parser.parse_args()
 
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
     from tokenizers import Tokenizer
+
+    from sunfish.datashards import write_manifest
 
     tokenizer = Tokenizer.from_file(str(args.tokenizer))
     args.output.mkdir(parents=True, exist_ok=True)
@@ -158,23 +159,26 @@ def main() -> None:
                 name, spec, tokenizer, args.output, args.tokens_per_bucket
             )
             results.append(result)
-            print(f"[ok] {name}: {result['tokens']:,} tokens / {result['documents']:,} docs "
+            print(f"[ok] {name}: {result['tokens']:,} tokens / {result['records']:,} records "
                   f"({result['seconds']}s)", flush=True)
         except Exception as error:  # gated dataset, schema drift, network
             failures.append({"bucket": name, "error": str(error)[:300]})
             print(f"[skip] {name}: {error}", file=sys.stderr, flush=True)
 
-    manifest = {
-        "tokenizer": str(args.tokenizer),
-        "vocab_size": tokenizer.get_vocab_size(),
-        "token_dtype": "uint32-le",
-        "tokens_per_bucket_cap": args.tokens_per_bucket,
-        "buckets": results,
-        "failures": failures,
+    manifest_hash = write_manifest(
+        args.output,
+        results,
+        tokenizer=str(args.tokenizer),
+        vocab_size=tokenizer.get_vocab_size(),
+        tokens_per_bucket_cap=args.tokens_per_bucket,
+        failures=failures,
+        purpose="stage-1 router calibration",
+    )
+    print(json.dumps({
         "total_tokens": sum(r["tokens"] for r in results),
-    }
-    (args.output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    print(json.dumps({k: manifest[k] for k in ("total_tokens", "failures")}, indent=2))
+        "manifest_hash": manifest_hash,
+        "failures": failures,
+    }, indent=2))
 
 
 if __name__ == "__main__":
