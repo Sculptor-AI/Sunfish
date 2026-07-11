@@ -47,6 +47,21 @@ on synthetic sharded checkpoints; validation against the gated upstream shard
 set and the model-level parity gate remain.
 **Gate:** control reproduces upstream logits and generations exactly.
 
+### Stage 0.5 — TPU readiness gauntlet (blocks ALL TPU stages)
+
+Eight ordered tests from the external TPU review
+(`coordination/external_tpu_review.md`) — the allocation owner's minimum
+bar, adopted verbatim: (1) multi-host topology + real collective, (2)
+process-disjoint GCS data reads, (3) sharded checkpoint load without
+per-host full replication, (4) tiny-dataset training smoke, (5) distributed
+checkpoint save/restore, (6) exact resume vs uninterrupted control, (7)
+preemption recovery without manual cleanup, (8) input throughput not
+GCS-starved. Prerequisites: distributed-init-first entrypoints, an all-host
+launcher, a Kauldron-safe launch path, a process-sharded input pipeline,
+an explicit mesh/partition policy, and fully pinned dependencies.
+**Gate:** all eight pass, in order, on the granted slice. No training job
+before this.
+
 ### Stage 1 — Router calibration (TPU/notebooks, ~$0)
 
 JAX forward hook → `RouterStatsAccumulator`, bucketed by phase

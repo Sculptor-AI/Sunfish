@@ -1,5 +1,17 @@
 # TPU readiness and launch runbook
 
+> **SUPERSEDED IN PART (2026-07-11):** `coordination/external_tpu_review.md`
+> is now authoritative for multi-host launch. Known corrections to this
+> document: (1) every entrypoint must call `jax.distributed.initialize()`
+> BEFORE any backend access — the current preflight ordering is wrong on
+> multi-host; (2) everything launches on every worker (`--worker=all`), not
+> one shell; (3) conversion does NOT happen on TPU nodes (storage-
+> constrained) — the converted checkpoint uploads to GCS and TPU hosts
+> restore from there; the 150 GB local-scratch instruction below no longer
+> applies; (4) `python -m kauldron.main` is unsafe on pods (eager
+> `jax.devices()` at import) — a custom launcher is required. Rewrite
+> pending in the infra lane.
+
 This is the operational path for TPU Research Cloud and ordinary Cloud TPU VM
 access. It prepares the environment and storage contract; the stage-specific
 training entry point is added only after the upstream forward pass and router
