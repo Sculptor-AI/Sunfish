@@ -3,17 +3,26 @@ set -euo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-python3.12}"
 VENV_DIR="${VENV_DIR:-.venv-tpu}"
+ENVIRONMENT_RECORD="${ENVIRONMENT_RECORD:-tpu-environment.txt}"
 : "${EXPECTED_TPU_DEVICES:?set EXPECTED_TPU_DEVICES to the granted global JAX device count}"
+: "${EXPECTED_TPU_PROCESSES:?set EXPECTED_TPU_PROCESSES to the TPU host/process count}"
 
 "${PYTHON_BIN}" -m venv "${VENV_DIR}"
 "${VENV_DIR}/bin/python" -m pip install --upgrade pip
-"${VENV_DIR}/bin/python" -m pip install -e '.[tpu]'
+"${VENV_DIR}/bin/python" -m pip install --requirement requirements-tpu.lock
+"${VENV_DIR}/bin/python" -m pip install --no-deps --editable .
 
 preflight=(
   "${VENV_DIR}/bin/sunfish-tpu-preflight"
   --require-tpu
+  --require-distributed
   --expected-devices "${EXPECTED_TPU_DEVICES}"
+  --expected-processes "${EXPECTED_TPU_PROCESSES}"
 )
+
+if [[ -n "${EXPECTED_LOCAL_TPU_DEVICES:-}" ]]; then
+  preflight+=(--expected-local-devices "${EXPECTED_LOCAL_TPU_DEVICES}")
+fi
 
 if [[ -n "${SUNFISH_GCS_WORKDIR:-}" ]]; then
   preflight+=(
@@ -24,4 +33,5 @@ if [[ -n "${SUNFISH_GCS_WORKDIR:-}" ]]; then
 fi
 
 "${preflight[@]}"
-"${VENV_DIR}/bin/python" -m pip freeze
+"${VENV_DIR}/bin/python" -m pip freeze > "${ENVIRONMENT_RECORD}"
+cat "${ENVIRONMENT_RECORD}"

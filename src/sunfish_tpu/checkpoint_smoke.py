@@ -1,75 +1,436 @@
-"""Write and exactly restore a small Orbax checkpoint on local disk or GCS.
+"""Distributed sharded Orbax save/restore and exact-resume smoke test.
 
-Run this once on the actual TPU topology and GCS prefix before a long job. The
-output path must not already exist and is intentionally retained as evidence
-that write, finalization, and restore all succeeded.
-
-This module is deliberately outside the dependency-free ``sunfish`` core.
+Every process must run this program with the same workdir and run ID.  It
+initializes distributed JAX before importing backend-adjacent libraries,
+builds the approved Phase-B global data mesh, creates arrays directly in their shardings,
+saves model/optimizer/RNG/loader state collectively, restores with explicit
+shardings, and compares one resumed optimizer update with an uninterrupted
+control using addressable shards.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 from typing import Any
+
+from sunfish_tpu.tpu_preflight import (
+    _topology_checks,
+    initialize_distributed_jax,
+    report,
+)
 
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
-def _tree_equal(left: Any, right: Any) -> bool:
-    import jax
-    import numpy as np
+def _resolve_mesh_shape(
+    *, global_device_count: int, process_count: int, data_axis_size: int
+) -> tuple[int, int]:
+    if global_device_count < 1 or process_count < 1:
+        raise ValueError("global device and process counts must be positive")
+    data = global_device_count if data_axis_size == 0 else data_axis_size
+    if data != global_device_count:
+        raise ValueError(
+            "the Phase-B FSDP smoke requires the data axis to span every "
+            f"global device ({global_device_count}), got {data}"
+        )
+    return data, 1
 
-    left_leaves, left_structure = jax.tree.flatten(left)
-    right_leaves, right_structure = jax.tree.flatten(right)
-    return left_structure == right_structure and all(
-        np.array_equal(np.asarray(a), np.asarray(b))
-        for a, b in zip(left_leaves, right_leaves, strict=True)
+
+def _deterministic_shard(
+    index: tuple[slice, ...] | None,
+    shape: tuple[int, ...],
+    *,
+    numpy: Any,
+    dtype: Any,
+    offset: int,
+) -> Any:
+    """Create only the requested shard using its global row-major indices."""
+    if shape == ():
+        return numpy.asarray(offset, dtype=dtype)
+    if index is None:
+        index = tuple(slice(0, size) for size in shape)
+    local_shape = tuple(part.stop - part.start for part in index)
+    coordinates = numpy.indices(local_shape, dtype=numpy.int64)
+    values = numpy.zeros(local_shape, dtype=numpy.int64)
+    stride = 1
+    for axis in range(len(shape) - 1, -1, -1):
+        values += (coordinates[axis] + index[axis].start) * stride
+        stride *= shape[axis]
+    return (values + offset).astype(dtype)
+
+
+def _make_array(
+    jax: Any,
+    numpy: Any,
+    *,
+    shape: tuple[int, ...],
+    sharding: Any,
+    dtype: Any,
+    offset: int,
+) -> Any:
+    return jax.make_array_from_callback(
+        shape,
+        sharding,
+        lambda index: _deterministic_shard(
+            index, shape, numpy=numpy, dtype=dtype, offset=offset
+        ),
+        dtype=dtype,
     )
 
 
-def run_smoke(workdir: str, run_id: str) -> dict[str, object]:
+def _tree_equal_addressable(jax: Any, numpy: Any, left: Any, right: Any) -> bool:
+    left_leaves, left_structure = jax.tree.flatten(left)
+    right_leaves, right_structure = jax.tree.flatten(right)
+    if left_structure != right_structure or len(left_leaves) != len(right_leaves):
+        return False
+    for left_leaf, right_leaf in zip(left_leaves, right_leaves, strict=True):
+        if left_leaf.shape != right_leaf.shape or left_leaf.dtype != right_leaf.dtype:
+            return False
+        left_shards = list(left_leaf.addressable_shards)
+        right_shards = list(right_leaf.addressable_shards)
+        if len(left_shards) != len(right_shards):
+            return False
+        for left_shard, right_shard in zip(left_shards, right_shards, strict=True):
+            if str(left_shard.index) != str(right_shard.index):
+                return False
+            if not numpy.array_equal(
+                numpy.asarray(left_shard.data), numpy.asarray(right_shard.data)
+            ):
+                return False
+    return True
+
+
+def _build_state(jax: Any, jnp: Any, numpy: Any, mesh: Any) -> tuple[Any, Any]:
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    data_size = int(mesh.shape["data"])
+    features = max(8, data_size * 2)
+    global_batch = data_size * 2
+    replicated = NamedSharding(mesh, P())
+    data_rows = NamedSharding(mesh, P("data", None))
+    expert_rows = NamedSharding(mesh, P("data", None, None))
+
+    params = {
+        # These mirror docs/sharding_plan.md Phase B: dense matrices and the
+        # routed-expert axis are row-sharded over the full data mesh.
+        "dense_weight": _make_array(
+            jax,
+            numpy,
+            shape=(features, features),
+            sharding=data_rows,
+            dtype=numpy.float32,
+            offset=1,
+        )
+        / numpy.float32(1024.0),
+        "expert_bank": _make_array(
+            jax,
+            numpy,
+            shape=(data_size, 2, features),
+            sharding=expert_rows,
+            dtype=numpy.float32,
+            offset=29,
+        )
+        / numpy.float32(4096.0),
+        "bias": _make_array(
+            jax,
+            numpy,
+            shape=(features,),
+            sharding=replicated,
+            dtype=numpy.float32,
+            offset=3,
+        )
+        / numpy.float32(2048.0),
+    }
+    optimizer = jax.tree.map(jnp.zeros_like, params)
+    state = {
+        "step": _make_array(
+            jax, numpy, shape=(), sharding=replicated, dtype=numpy.int32, offset=0
+        ),
+        "params": params,
+        "optimizer": {"momentum": optimizer},
+        "rng": _make_array(
+            jax,
+            numpy,
+            shape=(2,),
+            sharding=replicated,
+            dtype=numpy.uint32,
+            offset=0x12345678,
+        ),
+        "loader": {
+            "manifest_hash": _make_array(
+                jax,
+                numpy,
+                shape=(32,),
+                sharding=replicated,
+                dtype=numpy.uint8,
+                offset=17,
+            ),
+            "seed": _make_array(
+                jax,
+                numpy,
+                shape=(),
+                sharding=replicated,
+                dtype=numpy.uint32,
+                offset=20260711,
+            ),
+            "epoch": _make_array(
+                jax, numpy, shape=(), sharding=replicated, dtype=numpy.int32, offset=2
+            ),
+            "shard_sequence": _make_array(
+                jax,
+                numpy,
+                shape=(4,),
+                sharding=replicated,
+                dtype=numpy.int32,
+                offset=41,
+            ),
+            "current_shard": _make_array(
+                jax, numpy, shape=(), sharding=replicated, dtype=numpy.int32, offset=1
+            ),
+            "record_offset": _make_array(
+                jax, numpy, shape=(), sharding=replicated, dtype=numpy.int64, offset=0
+            ),
+            "packing_buffer": _make_array(
+                jax,
+                numpy,
+                shape=(8,),
+                sharding=replicated,
+                dtype=numpy.int32,
+                offset=73,
+            ),
+            "packing_size": _make_array(
+                jax, numpy, shape=(), sharding=replicated, dtype=numpy.int32, offset=5
+            ),
+        },
+    }
+    batch_template = {
+        "x": _make_array(
+            jax,
+            numpy,
+            shape=(global_batch, features),
+            sharding=data_rows,
+            dtype=numpy.float32,
+            offset=0,
+        ),
+        "y": _make_array(
+            jax,
+            numpy,
+            shape=(global_batch, features),
+            sharding=data_rows,
+            dtype=numpy.float32,
+            offset=11,
+        ),
+    }
+    return state, batch_template
+
+
+def _offset_batch(batch_template: Any, jnp: Any, offset: int) -> Any:
+    scale = jnp.asarray(1.0 / 4096.0, dtype=jnp.float32)
+    return {
+        "x": (batch_template["x"] + jnp.asarray(offset, dtype=jnp.float32)) * scale,
+        "y": (batch_template["y"] + jnp.asarray(offset * 3, dtype=jnp.float32)) * scale,
+    }
+
+
+def _update_function(jax: Any, jnp: Any):
+    def update(state: Any, batch: Any) -> tuple[Any, Any, Any]:
+        def loss_fn(params: Any) -> Any:
+            expert_residual = jnp.mean(params["expert_bank"], axis=(0, 1))
+            prediction = (
+                batch["x"] @ params["dense_weight"]
+                + params["bias"]
+                + expert_residual
+            )
+            return jnp.mean(jnp.square(prediction - batch["y"]))
+
+        loss, gradients = jax.value_and_grad(loss_fn)(state["params"])
+        momentum = jax.tree.map(
+            lambda old, grad: jnp.asarray(0.9, old.dtype) * old + grad,
+            state["optimizer"]["momentum"],
+            gradients,
+        )
+        params = jax.tree.map(
+            lambda value, velocity: value - jnp.asarray(0.01, value.dtype) * velocity,
+            state["params"],
+            momentum,
+        )
+        next_state = {
+            **state,
+            "step": state["step"] + jnp.asarray(1, dtype=state["step"].dtype),
+            "params": params,
+            "optimizer": {"momentum": momentum},
+            "rng": state["rng"]
+            + jnp.asarray([0x9E3779B9, 0x7F4A7C15], dtype=jnp.uint32),
+            "loader": {
+                **state["loader"],
+                "record_offset": state["loader"]["record_offset"]
+                + jnp.asarray(batch["x"].shape[0], dtype=jnp.int64),
+            },
+        }
+        return next_state, loss, gradients
+
+    return jax.jit(update)
+
+
+def run_smoke(
+    workdir: str,
+    run_id: str,
+    *,
+    require_tpu: bool = False,
+    expected_devices: int = 0,
+    expected_processes: int = 0,
+    expected_local_devices: int = 0,
+    data_axis_size: int = 0,
+) -> dict[str, object]:
     if not _RUN_ID.fullmatch(run_id):
         raise ValueError("run_id must contain only letters, numbers, dot, underscore, or dash")
 
-    import jax
+    # No backend-adjacent import may move above this call.
+    jax, initialization = initialize_distributed_jax(require_distributed=require_tpu)
     import jax.numpy as jnp
+    import numpy as np
+
+    topology = [
+        initialization,
+        *_topology_checks(
+            jax,
+            jnp,
+            require_tpu=require_tpu,
+            expected_devices=expected_devices,
+            expected_processes=expected_processes,
+            expected_local_devices=expected_local_devices,
+        ),
+    ]
+    topology_report = report(topology)
+    if not topology_report["ready"]:
+        raise RuntimeError(f"distributed topology failed: {json.dumps(topology_report)}")
+
+    # Orbax and etils may import JAX-adjacent code, so import them only now.
     import orbax.checkpoint as ocp
     from etils import epath
+    from jax.sharding import Mesh
 
-    state = {
-        "step": jnp.asarray(137, dtype=jnp.int32),
-        "params": {"probe": jnp.arange(64, dtype=jnp.bfloat16).reshape(8, 8)},
-        "optimizer": {"count": jnp.asarray(137), "moment": jnp.linspace(0, 1, 8)},
-        "data_cursor": jnp.asarray([12, 3456], dtype=jnp.int64),
-        "rng": jnp.asarray([0x12345678, 0x9ABCDEF0], dtype=jnp.uint32),
-    }
-    abstract_state = jax.tree.map(ocp.utils.to_shape_dtype_struct, state)
+    data_size, _ = _resolve_mesh_shape(
+        global_device_count=int(jax.device_count()),
+        process_count=int(jax.process_count()),
+        data_axis_size=data_axis_size,
+    )
+    ordered_devices = sorted(
+        jax.devices(),
+        key=lambda device: (int(device.process_index), int(device.id)),
+    )
+    mesh = Mesh(
+        np.asarray(ordered_devices, dtype=object).reshape(data_size),
+        ("data",),
+    )
+    initial_state, batch_template = _build_state(jax, jnp, np, mesh)
+    update = _update_function(jax, jnp)
+    first_batch = _offset_batch(batch_template, jnp, 0)
+    checkpoint_state, _, _ = update(initial_state, first_batch)
+    jax.block_until_ready(checkpoint_state)
+
     destination = epath.Path(workdir) / "sunfish-checkpoint-smoke" / run_id
-
-    with ocp.StandardCheckpointer() as checkpointer:
-        checkpointer.save(destination, state)
+    abstract_state = jax.tree.map(ocp.utils.to_shape_dtype_struct, checkpoint_state)
+    checkpointer = ocp.AsyncCheckpointer(ocp.StandardCheckpointHandler())
+    try:
+        checkpointer.save(
+            destination,
+            args=ocp.args.StandardSave(checkpoint_state),
+        )
         checkpointer.wait_until_finished()
-        restored = checkpointer.restore(destination, abstract_state)
-    exact = _tree_equal(state, restored)
-    if not exact:
-        raise RuntimeError("Orbax restored state does not exactly match saved state")
+        restored = checkpointer.restore(
+            destination,
+            args=ocp.args.StandardRestore(abstract_state),
+        )
+    finally:
+        checkpointer.close()
+
+    restored_exact = _tree_equal_addressable(jax, np, checkpoint_state, restored)
+    if not restored_exact:
+        raise RuntimeError("restored addressable shards do not exactly match saved state")
+
+    global_batch = int(batch_template["x"].shape[0])
+    second_batch = _offset_batch(batch_template, jnp, global_batch)
+    control_state, control_loss, control_gradients = update(checkpoint_state, second_batch)
+    resumed_state, resumed_loss, resumed_gradients = update(restored, second_batch)
+    jax.block_until_ready((control_state, resumed_state, control_gradients, resumed_gradients))
+
+    loss_exact = _tree_equal_addressable(jax, np, control_loss, resumed_loss)
+    gradients_exact = _tree_equal_addressable(
+        jax, np, control_gradients, resumed_gradients
+    )
+    update_exact = _tree_equal_addressable(jax, np, control_state, resumed_state)
+    if not (loss_exact and gradients_exact and update_exact):
+        raise RuntimeError(
+            "resumed loss, gradients, or updated state differs from uninterrupted control"
+        )
+
     return {
         "ready": True,
         "destination": str(destination),
-        "process_count": jax.process_count(),
-        "device_count": jax.device_count(),
-        "exact_restore": exact,
+        "process_index": int(jax.process_index()),
+        "process_count": int(jax.process_count()),
+        "global_device_count": int(jax.device_count()),
+        "local_device_count": int(jax.local_device_count()),
+        "mesh": {"data": data_size},
+        "sharding_policy": "docs/sharding_plan.md Phase B FSDP",
+        "restored_addressable_shards_exact": restored_exact,
+        "next_loss_exact": loss_exact,
+        "next_gradients_exact": gradients_exact,
+        "next_update_exact": update_exact,
+        "topology": topology_report,
     }
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    return default if value is None else int(value)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workdir", required=True, help="local path or gs://bucket/prefix")
-    parser.add_argument("--run-id", required=True, help="unique identifier; output is never overwritten")
+    parser.add_argument("--run-id", required=True, help="unique identifier; never overwritten")
+    parser.add_argument(
+        "--allow-non-tpu",
+        action="store_true",
+        help="run degraded on one local CPU/GPU process",
+    )
+    parser.add_argument(
+        "--expected-devices", type=int, default=_env_int("EXPECTED_TPU_DEVICES", 0)
+    )
+    parser.add_argument(
+        "--expected-processes", type=int, default=_env_int("EXPECTED_TPU_PROCESSES", 0)
+    )
+    parser.add_argument(
+        "--expected-local-devices",
+        type=int,
+        default=_env_int("EXPECTED_LOCAL_TPU_DEVICES", 0),
+    )
+    parser.add_argument(
+        "--data-axis-size",
+        type=int,
+        default=0,
+        help="Phase-B data-axis size; 0 uses every global device",
+    )
     args = parser.parse_args()
-    print(json.dumps(run_smoke(args.workdir, args.run_id), indent=2))
+    print(
+        json.dumps(
+            run_smoke(
+                args.workdir,
+                args.run_id,
+                require_tpu=not args.allow_non_tpu,
+                expected_devices=args.expected_devices,
+                expected_processes=args.expected_processes,
+                expected_local_devices=args.expected_local_devices,
+                data_axis_size=args.data_axis_size,
+            ),
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

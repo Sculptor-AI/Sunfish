@@ -14,13 +14,20 @@ dependencies = []
 
 [project.optional-dependencies]
 # Keep checkpoint conversion dependency-free. The TPU group follows the
-# official Gemma JAX stack; install it on the TPU VM, not on deployment hosts.
+# compatibility lock in requirements-tpu.lock. Install it on TPU VMs, not on
+# deployment hosts. Keep every direct requirement exact here as well so an
+# accidental `pip install .[tpu]` cannot float the training stack.
 tpu = [
+  "etils[epath-gcs]==1.14.0",
   "gemma==4.0.1",
-  "google-cloud-storage>=3.0",
-  "hackable-diffusion",
-  "jax[tpu]",
-  "orbax-checkpoint",
+  "google-cloud-storage==3.12.1",
+  "grain==0.2.18",
+  "hackable-diffusion==1.0.1",
+  "jax[tpu]==0.10.2",
+  "jaxlib==0.10.2",
+  "kauldron==1.4.4",
+  "libtpu==0.0.42.1",
+  "orbax-checkpoint==0.12.1",
 ]
 download = ["huggingface-hub>=0.34"]
 dev = []
@@ -29,6 +36,7 @@ dev = []
 sunfish-audit = "sunfish.checkpoint_audit:main"
 sunfish-checkpoint-smoke = "sunfish_tpu.checkpoint_smoke:main"
 sunfish-convert = "sunfish.checkpoint_convert:main"
+sunfish-kauldron = "sunfish_tpu.kauldron_launch:main"
 sunfish-tpu-preflight = "sunfish_tpu.tpu_preflight:main"
 
 [tool.setuptools]

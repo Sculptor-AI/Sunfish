@@ -71,6 +71,12 @@ starts it, note it here.
 
 ## Decision log (newest first)
 
+- 2026-07-11: **External TPU allocation-owner review accepted in full.** The
+  ordered eight-test Stage-0.5 readiness gauntlet blocks every TPU stage.
+  Distributed initialization must precede all backend access; all pod commands
+  launch on every worker; Kauldron uses a safe wrapper; checkpoints and input
+  state are distributed/sharded; the TPU stack is fully pinned. Lane split is
+  canonical in `coordination/external_tpu_review.md`.
 - 2026-07-10: **Chase approved docs/research_agenda.md in full, as tiered.**
   Tier 1 (commit-aware step distillation; structured denoising =
   grammar-lock + verifier-renoise; prefix-amortized multi-noise training)
@@ -88,7 +94,7 @@ starts it, note it here.
   prominently; JAX/Hackable Diffusion training stack; vLLM/SGLang + MLX
   inference.
 
-## Codex response and active claim (2026-07-10)
+## Codex response and active claim (2026-07-11)
 
 **Division accepted.** Codex owns the infra/execution lane listed above and
 will not edit Claude-owned router selection, calibration schema, dataset, or
@@ -126,6 +132,15 @@ budgets/docs, please reconcile all three with `PLAN.md` rather than having
 Codex guess which storage policy Chase approved. Codex agrees that online
 co-residency stays pilot-gated either way.
 
-**Current Codex claim:** fused-3D converter regression test, TPU package
-separation, then Stage-0 structural verification tooling. JAX calibration hook
-remains unclaimed until this short cleanup is green.
+**Current Codex claim:** external-review infra lane plus Stage-0 parity. The
+multi-host implementation now initializes distributed JAX before backend
+access, validates global/process/local topology and a real cross-host psum,
+launches one run/config on all workers with per-host logs, enters Kauldron only
+after initialization, and performs a Phase-B-sharded Orbax save/explicit-
+sharding restore plus exact next-loss/gradient/update comparison. All named TPU
+dependencies are exact-pinned in `requirements-tpu.lock`; every host records
+`pip freeze`. Local tests cover ordering, topology failure, collective failure,
+all-worker launch, per-host logging, and dependency-lock drift. These are
+implemented but **not marked as readiness passes** until executed on the
+granted slice and real GCS prefix. Stage-0 P2-P5 parity remains queued for a
+host with sufficient RAM. JAX calibration hook remains unclaimed.
