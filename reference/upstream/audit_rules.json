@@ -1,0 +1,8 @@
+[
+  ["vision", "vision_tower|embed_vision"],
+  ["routed_experts", "\\.experts\\."],
+  ["router", "\\.router\\."],
+  ["self_conditioning", "self_conditioning"],
+  ["encoder_layer_scalars", "encoder\\.language_model"],
+  ["embedding_or_head", "embed_tokens"]
+]

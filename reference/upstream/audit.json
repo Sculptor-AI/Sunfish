@@ -1,0 +1,42 @@
+{
+  "groups": {
+    "embedding_or_head": {
+      "tensors": 1,
+      "parameters": 738197504,
+      "bytes": 1476395008
+    },
+    "encoder_layer_scalars": {
+      "tensors": 30,
+      "parameters": 30,
+      "bytes": 60
+    },
+    "other": {
+      "tensors": 506,
+      "parameters": 1646057246,
+      "bytes": 3292114492
+    },
+    "routed_experts": {
+      "tensors": 60,
+      "parameters": 22837985280,
+      "bytes": 45675970560
+    },
+    "router": {
+      "tensors": 90,
+      "parameters": 10901760,
+      "bytes": 21803520
+    },
+    "self_conditioning": {
+      "tensors": 4,
+      "parameters": 17844992,
+      "bytes": 35689984
+    },
+    "vision": {
+      "tensors": 356,
+      "parameters": 572794416,
+      "bytes": 1145588832
+    }
+  },
+  "total_tensors": 1047,
+  "total_parameters": 25823781228,
+  "total_bytes": 51647562456
+}

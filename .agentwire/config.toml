@@ -1,0 +1,17 @@
+# agentwire config. Register each agent's headless CLI invocation.
+# {message} is replaced with the enveloped message; {root} with the repo root.
+
+[channel]
+file = "coordination/CHANNEL.wire"
+turn_cap = 6
+
+[agents.claude]
+id = "C"
+cmd = ["claude", "-p", "{message}"]
+
+[agents.codex]
+id = "X"
+cmd = ["codex", "exec", "--json", "--skip-git-repo-check", "--cd", "{root}", "--sandbox", "workspace-write", "{message}"]
+# Warm-lane resume per coordination/codex-wire-cost.md; rotated after 8 uses.
+session_cmd = ["codex", "exec", "resume", "--json", "--skip-git-repo-check", "{session}", "{message}"]
+session_regex = '"thread_id"\s*:\s*"([^"]+)"' 

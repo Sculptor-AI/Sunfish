@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sunfish-diffusion"
+version = "0.1.0"
+description = "Research tooling for the Sunfish coding-first diffusion language model"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+authors = [{ name = "SculptorAI" }]
+dependencies = []
+
+[project.optional-dependencies]
+# Keep checkpoint conversion dependency-free. The TPU group follows the
+# official Gemma JAX stack; install it on the TPU VM, not on deployment hosts.
+tpu = [
+  "gemma==4.0.1",
+  "google-cloud-storage>=3.0",
+  "hackable-diffusion",
+  "jax[tpu]",
+  "orbax-checkpoint",
+]
+download = ["huggingface-hub>=0.34"]
+dev = []
+
+[project.scripts]
+sunfish-audit = "sunfish.checkpoint_audit:main"
+sunfish-checkpoint-smoke = "sunfish_tpu.checkpoint_smoke:main"
+sunfish-convert = "sunfish.checkpoint_convert:main"
+sunfish-tpu-preflight = "sunfish_tpu.tpu_preflight:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

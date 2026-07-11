@@ -1,0 +1,101 @@
+[model]
+name = "sunfish-8b-a3b"
+source_model = "google/diffusiongemma-26B-A4B-it"
+text_only = true
+hidden_size = 2816
+num_layers = 30
+vocab_size = 262144
+canvas_length = 256
+
+[model.moe]
+source_experts = 128
+retained_experts = 32
+source_top_k = 8
+active_experts = 4
+expert_intermediate_size = 704
+selection_is_per_layer = true
+# The always-active shared expert is outside the routed bank and is never pruned.
+shared_experts = 1
+
+[sampling]
+sampler = "entropy_bound"
+max_denoising_steps = 48
+entropy_bound = 0.1
+temperature_max = 0.8
+temperature_min = 0.4
+confidence_threshold = 0.005
+# Matches StableAndConfidentStopper(stability_steps=...) in sunfish.sampling.
+stability_steps = 1
+
+# Entropy-bound selection and adaptive stopping read calibrated probabilities,
+# so on every backend the router and output head stay above expert-bank
+# precision until quantized selection stability is measured.
+
+# Primary target: RTX 5080, 16 GB VRAM.
+[deployment.cuda]
+backend = "vllm"
+gpu = "rtx-5080"
+vram_gb = 16
+weight_quantization = "int4"     # step down from int8 only after quality parity
+final_format_candidate = "nvfp4" # Blackwell FP4 tensor cores
+router_precision = "float16"
+embedding_head_quantization_bits = 8
+max_context_tokens = 32768
+
+# Secondary target: base M5 MacBook Pro, 24 GB unified memory.
+[deployment.mlx]
+backend = "mlx"
+weight_quantization_bits = 4
+router_precision = "float16"
+embedding_head_quantization_bits = 8
+target_unified_memory_gb = 24
+# macOS wires only ~16-18 GB of a 24 GB machine to the GPU by default;
+# benchmark at a bounded context rather than the upstream 262K maximum.
+max_context_tokens = 32768
+
+[training]
+framework = "jax-hackable-diffusion" # upstream recipes are JAX; export to safetensors last
+provider = "trc-tpu"
+tpu_topology = "pending"              # set only after project/zone/slice/host count are confirmed
+baseline_global_devices = 8           # smoke-test baseline; override for the granted slice
+fallback_provider = "runpod"         # a100-80gb (l40s-48gb for LoRA-only stages)
+checkpoint_format = "orbax-gcs"
+free_tier_scope = ["router_calibration", "zero_shot_evals", "smoke_tests"]
+checkpoint_interval_minutes = 30
+checkpoint_offsite = true    # TRC/community devices are preemptible; every save leaves the device
+checkpoint_style = "full"    # delta/base composition is allowed only after exact-resume tests exist
+checkpoint_rolling_window = 3
+teacher_distillation = "offline-full" # full trace store; lifecycle-deleted after stage-3 gate.
+                                      # Online co-residency still allowed only after a measured pilot.
+storage_budget_gb = 5000     # run profile: prioritize run quality; ~$3.30/day only while traces live
+
+[post_training]
+# Stages per docs/post_training.md: SFT -> rejection sampling -> diffusion RL.
+rejection_sampling_passes = 2
+rl_objective = "coupled-grpo"     # DiffuCoder recipe; StableDRL-style clipping
+rl_group_size = 8
+reward_stack = ["execution", "edit_format_validity", "static_analysis", "step_efficiency"]
+environments = ["swe-smith", "r2e-gym", "terminal-harbor", "mcp-simulated"]
+
+[calibration]
+# Inputs to sunfish.expert_selection; see docs/data.md for bucket sources.
+# Weights bias the objective toward product workloads. The mass gate is
+# normalized to the candidate's k/E uniform baseline: for 32/128, 0.9 means an
+# absolute floor of 0.225; for 48/128 it means 0.3375. Router mass is only the
+# first gate; layer-output reconstruction error is the decisive safety metric.
+min_coverage_relative_to_uniform = 0.9
+target_tokens_millions = 75
+
+[calibration.bucket_weights]
+code_completion = 1.0
+repo_edit = 1.0
+tool_calls = 1.0
+agent_trajectory = 1.0
+general_control = 0.25
+reasoning_control = 0.25
+
+[experiments]
+expert_counts = [128, 64, 48, 32, 24, 16]
+active_expert_counts = [8, 6, 4, 2]
+canvas_lengths = [64, 128, 256]
+max_denoising_steps = [12, 24, 48]

@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
+.venv-tpu/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+checkpoints/
+data/
+runs/
+wandb/
+tpu-environment*.txt
+infra/tpu/job.env
+
+# agentwire mutable state (config + glossary ARE committed)
+.agentwire/*.log
+.agentwire/*.lock
+.agentwire/cursor.*
+.agentwire/session.*

@@ -1,0 +1,16 @@
+sel=src/sunfish/expert_selection.py
+rs=src/sunfish/router_stats.py
+cvt=src/sunfish/checkpoint_convert.py
+aud=src/sunfish/checkpoint_audit.py
+cal=router calibration (stage 1; docs/calibration_hook.md)
+par=logit-parity harness (docs/parity_harness.md)
+tr=teacher distillation traces
+ck=checkpoint
+ms=milestone checkpoint
+rec=recovery training (stage 3)
+dl=upstream 52GB shard download
+g=tests green (prefix count: 41g = 41 tests green)
+s0..s10=PLAN.md pipeline stages
+w=TRC window
+gate=stage gate per PLAN.md
+env=verifiable environment (SWE-smith etc.)

@@ -1,0 +1,18 @@
+{
+  "rule": [
+    {
+      "action": { "type": "Delete" },
+      "condition": {
+        "age": 60,
+        "matchesPrefix": ["sunfish/traces/", "sunfish/calib/raw/"]
+      }
+    },
+    {
+      "action": { "type": "SetStorageClass", "storageClass": "NEARLINE" },
+      "condition": {
+        "age": 30,
+        "matchesPrefix": ["sunfish/milestones/"]
+      }
+    }
+  ]
+}
