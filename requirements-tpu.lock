@@ -5,8 +5,10 @@
 # rather than the independently newer libtpu release. The all-host entrypoint
 # saves `pip freeze` for the complete transitive environment on every run.
 
+dialog==1.1.0
 etils[epath-gcs]==1.14.0
-gemma==4.0.1
+flax==0.12.7
+gemma @ git+https://github.com/google-deepmind/gemma.git@09e7b48ae88720f6236b8266c7213eb51bb62b87
 google-cloud-storage==3.12.1
 grain==0.2.18
 hackable-diffusion==1.0.1
@@ -14,4 +16,7 @@ jax[tpu]==0.10.2
 jaxlib==0.10.2
 kauldron==1.4.4
 libtpu==0.0.42.1
+numpy==2.4.6
+optax==0.2.8
 orbax-checkpoint==0.12.1
+sentencepiece==0.2.1

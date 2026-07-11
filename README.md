@@ -63,6 +63,7 @@ supports a specific candidate.
 - `docs/architecture.md` — architecture choice, alternatives, risks, and gates
 - `docs/upstream_checkpoint.md` — audited live config/index and tensor-name contract
 - `docs/training.md` — training infrastructure, phase map, and cost envelopes
+- `docs/training_harness.md` — executable trainer, records, checkpoints, and TPU launch
 - `docs/data.md` — calibration/recovery/SFT data mixes and evaluation suite
 - `docs/post_training.md` — SFT → rejection sampling → diffusion RL recipe
 - `configs/sunfish-8b-a3b.toml` — initial candidate configuration
@@ -72,6 +73,7 @@ supports a specific candidate.
 - `src/sunfish/checkpoint_convert.py` — dependency-free streaming text/pruning converter
 - `src/sunfish_tpu/tpu_preflight.py` — JAX device, package, and GCS readiness checks
 - `src/sunfish_tpu/checkpoint_smoke.py` — exact Orbax save/restore probe for local/GCS paths
+- `src/sunfish_tpu/training/` — strict Kauldron harness and prefix-amortized objective
 - `infra/tpu/README.md` — TPU VM bootstrap, access checklist, and launch gates
 - `infra/gcp/README.md` — GCP setup and cost guardrails (budget alerts, lifecycle, egress rules)
 - `src/sunfish/router_stats.py` — bucketized router-mass accumulation schema
@@ -95,8 +97,13 @@ PYTHONPATH=src python -m sunfish.checkpoint_convert \
   --output /path/to/diffusiongemma-text-control \
   --retained-experts 128 --top-k 8 --dry-run
 
-# On the requested v4-64 TPU VM, after: pip install -e '.[tpu]'. Replace 64
-# with the granted global JAX device count if the allocation differs.
+# Validate a training run contract without importing JAX.
+PYTHONPATH=src python -m sunfish_tpu.training.train \
+  --config configs/training/sunfish-smoke.toml --validate-only
+
+# On the requested v4-64 TPU VM, use scripts/bootstrap_tpu.sh so the exact
+# unreleased Gemma adapter commit is installed without floating dependencies.
+# Replace 64 with the measured global JAX device count if the grant differs.
 sunfish-tpu-preflight --require-tpu --expected-devices 64 \
   --gcs-workdir gs://YOUR_BUCKET/sunfish/experiments --require-gcs --probe-gcs-read
 ```

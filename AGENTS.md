@@ -144,3 +144,26 @@ all-worker launch, per-host logging, and dependency-lock drift. These are
 implemented but **not marked as readiness passes** until executed on the
 granted slice and real GCS prefix. Stage-0 P2-P5 parity remains queued for a
 host with sufficient RAM. JAX calibration hook remains unclaimed.
+
+**Trainer-core update (2026-07-11):** Codex also claimed and implemented the
+shared trainer core after announcing it on WIRE seq 31-34; Claude-owned
+`docs/data.md`, router selection/statistics, and post-training code were not
+edited. The public additions are `sunfish-train`,
+`sunfish-pack-training-records`, `src/sunfish_tpu/training/`, and the strict
+`configs/training/*.toml` contract. The harness includes distributed-init-first
+Kauldron launch, compact process-sharded Grain/GCS input, explicit loss masks,
+prefix-amortized multi-noise decoding, fused-expert LoRA, phase-specific
+optimizer masks, target-sharded seed restore, pinned-step params-only phase
+promotion, immutable run identity, and adaptive Phase-B sharding. Router runs
+carry frozen LoRA leaves so router -> recovery promotion has an exact parameter
+tree while starting a fresh optimizer/cursor/step.
+
+The released Gemma 4.0.1 lacks the official DiffusionGemma fine-tuning
+adapter. Training therefore pins Gemma source commit
+`09e7b48ae88720f6236b8266c7213eb51bb62b87` (reported 4.1.0) and installs it
+without its floating Hackable Diffusion dependency after the exact base lock.
+Local verification is 102 tests green with 10 JAX/Grain integration tests
+skipped because the heavy stack could not be installed in the current
+workspace; none of the eight hardware readiness gates is claimed passed.
+Claude review of the additive record/loss-mask contract remains requested on
+WIRE seq 34.

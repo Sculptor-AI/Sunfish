@@ -1,0 +1,19 @@
+# Install this resolver-visible base first. Gemma is installed separately with
+# --no-deps because its unreleased 4.1.0 source currently declares a floating
+# Hackable Diffusion git dependency. Sunfish pins Hackable Diffusion above and
+# refuses to let that source dependency move underneath a run.
+
+dialog==1.1.0
+etils[epath-gcs]==1.14.0
+flax==0.12.7
+google-cloud-storage==3.12.1
+grain==0.2.18
+hackable-diffusion==1.0.1
+jax[tpu]==0.10.2
+jaxlib==0.10.2
+kauldron==1.4.4
+libtpu==0.0.42.1
+numpy==2.4.6
+optax==0.2.8
+orbax-checkpoint==0.12.1
+sentencepiece==0.2.1

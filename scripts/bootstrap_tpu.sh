@@ -9,7 +9,11 @@ ENVIRONMENT_RECORD="${ENVIRONMENT_RECORD:-tpu-environment.txt}"
 
 "${PYTHON_BIN}" -m venv "${VENV_DIR}"
 "${VENV_DIR}/bin/python" -m pip install --upgrade pip
-"${VENV_DIR}/bin/python" -m pip install --requirement requirements-tpu.lock
+"${VENV_DIR}/bin/python" -m pip install --requirement requirements-tpu-base.lock
+# Gemma 4.1.0 is not released yet. Its source metadata points at an unpinned
+# Hackable Diffusion branch, so install the audited commit without dependencies
+# after the exact base stack. Runtime validation checks direct_url.json too.
+"${VENV_DIR}/bin/python" -m pip install --no-deps --requirement requirements-gemma-source.lock
 "${VENV_DIR}/bin/python" -m pip install --no-deps --editable .
 
 preflight=(

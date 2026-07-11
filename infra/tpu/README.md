@@ -1,65 +1,52 @@
 # TPU readiness and launch runbook
 
-> **SUPERSEDED IN PART (2026-07-11):** `coordination/external_tpu_review.md`
-> is now authoritative for multi-host launch. Known corrections to this
-> document: (1) every entrypoint must call `jax.distributed.initialize()`
-> BEFORE any backend access — the current preflight ordering is wrong on
-> multi-host; (2) everything launches on every worker (`--worker=all`), not
-> one shell; (3) conversion does NOT happen on TPU nodes (storage-
-> constrained) — the converted checkpoint uploads to GCS and TPU hosts
-> restore from there; the 150 GB local-scratch instruction below no longer
-> applies; (4) `python -m kauldron.main` is unsafe on pods (eager
-> `jax.devices()` at import) — a custom launcher is required. Rewrite
-> pending in the infra lane.
+`coordination/external_tpu_review.md` is authoritative. This runbook is the
+executable path implementing it. No TPU training starts until the eight tests
+in `PLAN.md` Stage 0.5 pass in order on the granted slice.
 
-This is the operational path for TPU Research Cloud and ordinary Cloud TPU VM
-access. It prepares the environment and storage contract; the stage-specific
-training entry point is added only after the upstream forward pass and router
-hook pass their Stage 0/1 correctness gates.
+## Allocation facts required first
 
-## What to obtain before the allocation starts
+Obtain the accelerator/topology, actual visible device count, host count,
+local devices per host, VM image/runtime, preemption policy, allocation dates,
+project, zone, attached service account, GCS bucket, and egress restrictions.
+Do not infer any of those from the phrase "v4-64".
 
-- GCP project and TPU quota/grant, TPU type, zone, topology, and whether it is
-  a single host or pod slice.
-- A service account attached to the TPU VM with read/write access restricted
-  to one Sunfish GCS prefix. Checkpoints must never exist only on preemptible
-  local storage.
-- A GCS work directory such as `gs://bucket/sunfish/experiments`.
-- At least 150 GB of persistent scratch space for the 51.7 GB upstream BF16
-  checkpoint, a no-prune text control, conversion output, and download cache.
-- A Hugging Face account that has accepted the DiffusionGemma license terms
-  and a token supplied through the VM environment, never committed to Git.
+The service account is restricted to the Sunfish GCS prefixes it needs:
 
-Ask the TPU contact for these exact facts: accelerator/topology, visible chip
-count, host count, VM image/runtime, preemption policy, allocation dates,
-project ID, zone, service account, GCS bucket, and egress restrictions.
+- immutable data manifests/shards (read);
+- exact-tree Orbax seed checkpoints (read);
+- the selected run workdir (read/write).
 
-## Bootstrap on the TPU VM
+Conversion and the 51 GB Hugging Face download happen off the TPU VMs. TPU
+workers restore the parity-approved Orbax seed directly from GCS; no worker
+needs 150 GB of checkpoint scratch or a Hugging Face token.
 
-The project requires Python 3.12+. JAX's official TPU installation is the
-`jax[tpu]` extra; the project extra also installs Gemma 4.0.1, Hackable
-Diffusion explicitly, Kauldron through Gemma, Orbax, and Google Cloud Storage
-support.
+## Fully ordered bootstrap
+
+The bootstrap uses Python 3.12, the exact TPU stack in
+`requirements-tpu-base.lock`, and exact Gemma source commit
+`09e7b48ae88720f6236b8266c7213eb51bb62b87`. Gemma is installed with
+`--no-deps` because its unreleased 4.1.0 metadata currently points at a
+floating Hackable Diffusion branch. The runtime checks `direct_url.json` and
+every direct version before training.
+
+Set the measured values on every host:
 
 ```bash
-git clone YOUR_SUNFISH_REPOSITORY
-cd sunfish-v2
-
-# Requested v4-64 exposes 64 global JAX devices; replace this if the grant differs.
-export EXPECTED_TPU_DEVICES=64
-export SUNFISH_GCS_WORKDIR=gs://YOUR_BUCKET/sunfish/experiments
-bash scripts/bootstrap_tpu.sh > tpu-environment.txt
+export EXPECTED_TPU_DEVICES=32
+export EXPECTED_TPU_PROCESSES=8
+export EXPECTED_LOCAL_TPU_DEVICES=4
+export SUNFISH_GCS_WORKDIR=gs://YOUR_BUCKET/sunfish/runs
+export VENV_DIR=.venv-tpu
 ```
 
-The bootstrap must finish with no failed checks. Preserve
-`tpu-environment.txt` beside the experiment manifest so the exact resolved
-package versions are recoverable.
+Run `scripts/bootstrap_tpu.sh` concurrently on every worker. Its ordering is
+binding: create environment → install exact stack → distributed JAX init →
+topology and real collective → GCS read/list probe → record `pip freeze`.
+The first distributed checkpoint smoke is the write/read authorization probe.
+Do not import Kauldron or ask JAX for devices before distributed init.
 
-For a Cloud TPU VM rather than a pre-provisioned TRC machine, create and SSH to
-the resource using the accelerator type, runtime, project, and zone actually
-granted to you. Keep these as variables because available TPU generations and
-zones change. The custom service account must be passed explicitly; merely
-creating it does not attach it to the TPU VM:
+For an ordinary Cloud TPU VM, attach the service account explicitly:
 
 ```bash
 gcloud compute tpus tpu-vm create "$TPU_NAME" \
@@ -69,66 +56,119 @@ gcloud compute tpus tpu-vm create "$TPU_NAME" \
   --version "$TPU_RUNTIME" \
   --service-account "$TPU_SERVICE_ACCOUNT" \
   --scopes cloud-platform
-
-gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
-  --project "$PROJECT_ID" \
-  --zone "$ZONE"
 ```
 
-Use `--internal-ips` only after Private Google Access and a controlled outbound
-path for the Python/Hugging Face bootstrap have both been tested. Otherwise an
-internal-only VM can reach GCS but cannot install packages or download the
-gated upstream checkpoint.
+Use internal IPs only after Private Google Access and the dependency-install
+path have both been tested.
 
-On multi-host slices, setup and the eventual job command must run on every
-worker. Do not assume a one-host v3-8 launch command applies to a pod slice.
+## All-host launcher
 
-## Mandatory storage smoke test
+Every pod command goes through `scripts/launch_tpu_pod.sh`. It uses
+`gcloud ... --worker=all`, gives every host one run ID/config/command, records
+the exact remote command, and keeps a separate host log and `pip freeze`.
+`scripts/tpu_host_entrypoint.sh` refuses a missing config or topology.
 
-After preflight, explicitly prove that Orbax can finalize and exactly restore
-state from the real GCS prefix. Use a unique run ID; the small artifact is
-retained as evidence and never overwritten by the tool.
+Never invoke `python -m kauldron.main` directly: that module calls
+`jax.devices()` at import. `sunfish-train` and `sunfish-kauldron` initialize
+and validate distributed JAX first.
+
+## Ordered Stage-0.5 commands
+
+### 1. Topology and collective
+
+The bootstrap preflight is the test. Save every host's JSON report. Device,
+process, and local-device counts must equal the grant, device ownership must be
+process-disjoint, and the real cross-host `psum` must pass.
+
+### 2. Process-disjoint GCS input
+
+Pack a tiny tokenized fixture and upload its immutable output directory:
 
 ```bash
-.venv-tpu/bin/sunfish-checkpoint-smoke \
-  --workdir "$SUNFISH_GCS_WORKDIR" \
-  --run-id "$(date -u +%Y%m%dT%H%M%SZ)-topology-smoke"
+PYTHONPATH=src python3 -m sunfish_tpu.training.pack_records \
+  --input tiny.jsonl \
+  --output /tmp/sunfish-tiny-v1 \
+  --records-per-shard 256 \
+  --source stage05-disjoint-input
 ```
 
-This smoke state contains a step, parameters, optimizer state, data cursor,
-and RNG state. The training loop must later add an interruption/restart test
-that compares the next loss and update against an uninterrupted control.
+Copy the reported manifest digest into a smoke TOML. The Grain pipeline slices
+record IDs by JAX process before shuffle and retains `record_id` in every
+batch. Record read evidence per host must show no overlap and exhaustive
+coverage.
 
-## Checkpoint policy for real jobs
+### 3, 5, and 6. Sharded load, save/restore, exact resume
 
-- Use Orbax `CheckpointManager` with async checkpointing to the GCS workdir.
-- Save every 30 minutes during calibration/recovery and at every stage gate.
-- At preemption, wait for checkpoint finalization before exiting.
-- Store model/optimizer state, global step, RNG streams, data cursor/shuffle
-  epoch, sampler schedule state, and resolved configuration.
-- Keep metrics and the package freeze off-device as well.
-- No multi-hour job starts until exact interruption/resume is demonstrated.
-
-## Stage 0 checkpoint conversion
-
-Download the accepted upstream checkpoint once to persistent scratch. First
-validate the no-prune text-only plan, then run it into a new directory:
+Run the synthetic sharded-state proof collectively with a unique ID:
 
 ```bash
-.venv-tpu/bin/sunfish-convert \
-  --source /mnt/disks/sunfish-cache/diffusiongemma-26B-A4B-it \
-  --output /mnt/disks/sunfish-cache/diffusiongemma-text-control \
-  --retained-experts 128 \
-  --top-k 8 \
-  --dry-run
-
-.venv-tpu/bin/sunfish-convert \
-  --source /mnt/disks/sunfish-cache/diffusiongemma-26B-A4B-it \
-  --output /mnt/disks/sunfish-cache/diffusiongemma-text-control \
-  --retained-experts 128 \
-  --top-k 8
+scripts/launch_tpu_pod.sh \
+  --run-id stage05-checkpoint-smoke \
+  --config configs/training/sunfish-smoke.toml \
+  -- \
+  .venv-tpu/bin/sunfish-checkpoint-smoke \
+  --workdir gs://YOUR_BUCKET/sunfish/readiness \
+  --run-id stage05-checkpoint-smoke \
+  --expected-devices "$EXPECTED_TPU_DEVICES" \
+  --expected-processes "$EXPECTED_TPU_PROCESSES" \
+  --expected-local-devices "$EXPECTED_LOCAL_TPU_DEVICES"
 ```
 
-Do not generate the 32-expert candidate until this control has reproduced
-upstream text logits and seeded generations. Pruning additionally requires a
-per-layer selection JSON produced from calibration traces.
+Then repeat the interruption/control comparison with the real trainer. Its
+initializer releases random base arrays and restores the exact Gemma tree into
+target NamedShardings. Kauldron checkpoints model, optimizer, step, timer, and
+the Grain iterator together; RNG is reproduced from the saved step and pinned
+seed. Compare the next record IDs, loss, gradients, and update after restart
+with the uninterrupted control.
+
+### 4. 100-500 update real training smoke
+
+Replace all placeholders in a copied smoke config, including the actual
+dataset digest and parity-approved exact-tree Orbax seed, then validate it:
+
+```bash
+.venv-tpu/bin/sunfish-train \
+  --config configs/training/sunfish-smoke.toml \
+  --validate-only
+```
+
+Launch the real 100-update job:
+
+```bash
+scripts/launch_tpu_pod.sh \
+  --run-id sunfish-stage05-smoke \
+  --config configs/training/sunfish-smoke.toml \
+  -- \
+  .venv-tpu/bin/sunfish-train \
+  --config configs/training/sunfish-smoke.toml
+```
+
+The strict schema rejects a smoke outside 100-500 updates. Tiny-batch overfit,
+finite loss, and changing trainable leaves are required; mere process survival
+is not a pass.
+
+### 7. Preemption recovery
+
+Interrupt the job after a finalized checkpoint and rerun the identical
+all-host command. No checkpoint deletion, cursor editing, or new run config is
+allowed. `sunfish-run.json` rejects any changed config, dataset, dependency,
+seed checkpoint, model, or topology.
+
+### 8. Input throughput
+
+Measure host read latency/bytes and accelerator step time during the smoke.
+Increase Grain workers/prefetch only from evidence. A training step waiting on
+small GCS range reads fails the gate even when correctness tests pass.
+
+## Checkpoint policy
+
+- Every save goes to the run's GCS workdir through Orbax/Kauldron.
+- Default retention is three full checkpoints; interval comes from the strict
+  run TOML and is converted from the approved wall-clock target after the
+  throughput smoke.
+- Clean shutdown waits for async finalization. Abrupt preemption loses only
+  work after the last finalized checkpoint; restart restores automatically.
+- No multi-hour job starts before the real exact-resume comparison passes.
+
+See `docs/training_harness.md` for phase masks, prefix-amortized multi-noise
+training, record/loss-mask semantics, and the initial checkpoint contract.
