@@ -1,0 +1,84 @@
+{
+  "failures": [],
+  "manifest_version": 1,
+  "purpose": "stage-1 router calibration",
+  "shards": [
+    {
+      "bin": "code_completion.bin",
+      "bucket": "code_completion",
+      "config": "hf://datasets/bigcode/commitpackft/data/javascript/*.jsonl",
+      "dataset": "json",
+      "idx": "code_completion.idx",
+      "records": 7678,
+      "seconds": 2.9,
+      "sha256_bin": "46f8ea71e1464813213d8f9875f30aa64999fb946f7ad84393c4ded764d88699",
+      "sha256_idx": "34f0e3b87c4cf08fd7ceb380ab39eac904aac58e04c6021325c25b41abc8903e",
+      "tokens": 2000200
+    },
+    {
+      "bin": "repo_edit.bin",
+      "bucket": "repo_edit",
+      "config": "hf://datasets/bigcode/commitpackft/data/python/*.jsonl",
+      "dataset": "json",
+      "idx": "repo_edit.idx",
+      "records": 3811,
+      "seconds": 2.0,
+      "sha256_bin": "7e19b5ba4331be9731acc13189a7b65ea9410f2247027ca1cefa67b20aaac2de",
+      "sha256_idx": "a92de8abf57f9a12f77cbcd10f7567161c83aa0d0fb6e597ce7d6868302efb23",
+      "tokens": 2000195
+    },
+    {
+      "bin": "tool_calls.bin",
+      "bucket": "tool_calls",
+      "config": "default",
+      "dataset": "glaiveai/glaive-function-calling-v2",
+      "idx": "tool_calls.idx",
+      "records": 3635,
+      "seconds": 7.4,
+      "sha256_bin": "ffce6b87e23ffdafc1f35b32047cf0de4ff67440c2d3bf537a491f2f1fd4014e",
+      "sha256_idx": "4faecf5152ef9d2e2c7353bc5328f10917612b98bf746bafc2e50a10a88abde8",
+      "tokens": 2000533
+    },
+    {
+      "bin": "agent_trajectory.bin",
+      "bucket": "agent_trajectory",
+      "config": "default",
+      "dataset": "SWE-bench/SWE-smith-trajectories",
+      "idx": "agent_trajectory.idx",
+      "records": 75,
+      "seconds": 5.5,
+      "sha256_bin": "38464cbf907c2a5371e4858f077bfee07d35eec1b6a649dd216c333a3cb7aef8",
+      "sha256_idx": "8af1ec1e22216db8d320ecc5490372e14f17de18781ad8b49ece49417d6c5590",
+      "tokens": 2014713
+    },
+    {
+      "bin": "general_control.bin",
+      "bucket": "general_control",
+      "config": "all",
+      "dataset": "HuggingFaceTB/smoltalk",
+      "idx": "general_control.idx",
+      "records": 2254,
+      "seconds": 3.3,
+      "sha256_bin": "61b76855d2075d801e74587dc89f8bc795476580e8d5232920366e458c2cd2f0",
+      "sha256_idx": "daa8680ceb0b838ec6ec2708d581dd7bc22cda2b9a39e977e8f8f2f3217f3de9",
+      "tokens": 2001135
+    },
+    {
+      "bin": "reasoning_control.bin",
+      "bucket": "reasoning_control",
+      "config": "main",
+      "dataset": "openai/gsm8k",
+      "idx": "reasoning_control.idx",
+      "records": 7473,
+      "seconds": 1.8,
+      "sha256_bin": "d0f60d6a49b62e89f1dddd093af2cf4b0758e52bde03e5e750b2a338f590cbdb",
+      "sha256_idx": "35e8cf38566a99dc819ff4cbbfa39bd896a2881204d44b26e8f4486c78566cf9",
+      "tokens": 1369984
+    }
+  ],
+  "tokenizer": "/Users/chaseculbertson/sunfish-cache/diffusiongemma-26B-A4B-it/tokenizer.json",
+  "tokens_per_bucket_cap": 2000000,
+  "total_records": 24926,
+  "total_tokens": 11386760,
+  "vocab_size": 262144
+}

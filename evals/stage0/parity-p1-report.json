@@ -1,0 +1,11 @@
+{
+  "checks": {
+    "p1.1_tokenizer_identical": true,
+    "p1.2_config_diff_exact": true,
+    "p1.2_vision_config_null": true,
+    "p1.3_tensor_set_exact": true,
+    "p1.3_all_tensor_hashes_equal": true
+  },
+  "tensors_compared": 691,
+  "passed": true
+}
