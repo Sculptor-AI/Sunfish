@@ -27,8 +27,10 @@ for "really good at coding/agentic," and most of it transfers down-scale:
 
 Items 1, 3, 4, 5, 6 transfer to Sunfish nearly verbatim. Item 2 scales down
 via open tooling (below). GLM's asynchronous RL infrastructure does not
-transfer — at our scale a simple synchronous rollout loop on one v3-8 plus a
-CPU box for sandboxes is enough.
+transfer — at our scale a simple synchronous rollout loop on one
+topology-verified slice plus a CPU box for sandboxes is enough. This may be a
+subset of the granted allocation or a separately allocated small slice; the
+plan does not hard-code a TPU generation.
 
 ## Sunfish post-training stages
 
@@ -115,10 +117,10 @@ simply not buy.
   synthesized from seed tasks (GLM's recipe) at hundreds-not-thousands scale.
 - **Tool calling**: schema-validated simulated MCP servers; BFCLv3 and
   MCP-Universe as held-out evals, never trained on.
-- **Topology**: rollout generation on the v3-8 (batched diffusion sampling is
-  exactly what the hardware likes), environment execution on a CPU VM with
-  Docker; the two talk over a queue. Sunfish's sandbox bill is a small GCE
-  instance, not a cluster.
+- **Topology**: rollout generation on one topology-verified TPU slice (batched
+  diffusion sampling is the accelerator workload), environment execution on a
+  CPU VM with Docker; the two talk over a queue. Sunfish's sandbox bill is a
+  small GCE instance, not a cluster.
 
 ## Evaluation additions (beyond `docs/data.md`)
 

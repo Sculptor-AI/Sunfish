@@ -18,6 +18,14 @@ timer state, and the checkpointable Grain iterator. RNG streams are pure
 functions of the checkpointed step and pinned run seed. A restart with the
 same workdir therefore resumes the complete deterministic state.
 
+The all-host launcher also binds the run to its code: every worker must match
+the controller's Git commit and deterministic source-tree SHA-256 before the
+trainer starts. `sunfish-run.json` records that identity, and the readiness
+ledger rejects evidence produced by a different tree. See
+`infra/tpu/README.md` for the clean-checkout workflow. The launcher also
+verifies the raw config-file SHA-256 on every host; the run identity records
+both that byte hash and the canonical parsed-config digest.
+
 The implementation is under `src/sunfish_tpu/training/`; the stable Kauldron
 entry config is `configs/training/sunfish.py`.
 
@@ -131,8 +139,70 @@ host's CPU RAM.
 The current safetensors converter and this initializer intentionally meet at
 an explicit boundary: Stage 0 must produce the exact-tree Orbax seed after
 model-level parity. A Hugging Face directory is not accepted by pretending it
-is an Orbax checkpoint. This remains a Stage-0 execution item, not hidden
-inside the trainer.
+is an Orbax checkpoint. `sunfish-orbax-seed` closes that boundary from
+Google's official JAX/Orbax DiffusionGemma checkpoint: it slices the same
+per-layer expert IDs, saves a normalized pruned intermediate, traces the exact
+target model tree with `jax.eval_shape`, uses the pinned public Gemma loader to
+reconcile checkpoint-vs-Linen path differences, and saves the final bare
+exact-tree seed. It validates all 120 prunable JAX leaves, target paths/shapes/
+dtypes, saved Orbax metadata, the audited 25,250,986,812→8,114,384,892
+parameter counts, source revision, selection hash, and runtime
+pins. The selection manifest must also state `purpose`, `selection_method`,
+and a boolean `promotion_allowed`; those fields are copied into the seed
+sidecar. A 96 GiB physical-RAM guard plus an explicit acknowledgement prevents
+running this multi-GB job on Chase's laptop.
+
+Run it on a high-memory Linux CPU VM. For Stage-0.5 only, use the committed
+`configs/training/stage05-first32-selection.json`. That deterministic first-32
+selection exists solely to exercise the real 8B checkpoint and training path
+before Stage-1 calibration is allowed to run. Its `promotion_allowed=false`
+marker is binding: it supplies no quality evidence and must never seed a
+research, evaluation, recovery, or release run. Once Stage 2 approves the real
+selection, rerun this materializer with that same manifest used by the
+safetensors converter.
+
+```bash
+PYTHON_BIN=python3.12 VENV_DIR=.venv-seed scripts/bootstrap_seed_cpu.sh
+
+# This is the exact public path hard-coded by Google's pinned DiffusionGemma
+# fine-tuning source. Inventory it before the high-memory job.
+.venv-seed/bin/sunfish-gcs-inventory \
+  --uri gs://gemma-data/checkpoints/diffusiongemma-26B-A4B-it \
+  --anonymous \
+  --output /tmp/diffusiongemma-source-inventory.json
+export SOURCE_REVISION="gcs-inventory-sha256:$(python3 -c \
+  'import json,sys; print(json.load(open(sys.argv[1]))["sha256"])' \
+  /tmp/diffusiongemma-source-inventory.json)"
+
+JAX_PLATFORMS=cpu .venv-seed/bin/sunfish-orbax-seed \
+  --source gs://gemma-data/checkpoints/diffusiongemma-26B-A4B-it \
+  --source-revision "$SOURCE_REVISION" \
+  --source-anonymous \
+  --selection configs/training/stage05-first32-selection.json \
+  --retained-experts 32 --top-k 4 \
+  --intermediate gs://YOUR_BUCKET/sunfish/checkpoints/sunfish-stage05-first32-pruned-nested \
+  --output gs://YOUR_BUCKET/sunfish/checkpoints/sunfish-stage05-first32-exact-tree \
+  --manifest gs://YOUR_BUCKET/sunfish/checkpoints/sunfish-stage05-first32-exact-tree.json \
+  --ack-high-memory-cpu
+```
+
+The intermediate is deliberately retained until the final exact-tree seed has
+passed Stage-0.5 sharded restore. Delete it only through the bucket lifecycle
+after that evidence exists.
+
+The seed sidecar embeds complete source and output GCS inventories: relative
+object name, generation, size, and CRC32C for every Orbax object. Seed
+materialization rejects a source revision that does not equal the live source
+inventory. Every TPU training restore and the real seed-load gate re-list the
+output prefix and reject any replaced object before model compilation.
+
+Every exact-tree training config pins both the seed sidecar path and its
+SHA-256. At runtime every host verifies the sidecar, its declared output path,
+target-vs-saved tree signature, source revision, selection hash, and promotion
+policy before compilation. The smoke phase accepts only the non-promotable
+Stage-0.5 seed; router and later exact-tree phases reject it. Copy the actual
+sidecar digest into `checkpoint.init_manifest_sha256` alongside the dataset
+manifest digest before launch.
 
 For later phases, `kauldron-params` points at a prior run workdir plus a
 finalized numeric checkpoint step. Kauldron restores only
@@ -148,6 +218,10 @@ bootstrap installs exact commit
 `--no-deps` after the exact base stack. This prevents that source tree's
 floating Hackable Diffusion dependency from moving. Runtime validation reads
 the installed distribution's `direct_url.json` and rejects any other commit.
+`sunfish-runtime-api-audit` then parses the installed sources without importing
+JAX or those packages. It fails bootstrap if the private LoRA, ragged-MoE,
+mask/cache, Kauldron process-slicing/checkpoint-loop, or Orbax restore/commit
+marker contracts differ, and records SHA-256 hashes for all reviewed files.
 Sunfish deliberately does not import the upstream `sft_model` module: that
 module imports an unused evaluator which globally overrides Orbax path
 finalization. The small prefix helper and encoder loss are implemented locally
@@ -155,12 +229,21 @@ against the pinned lower-level adapter APIs instead.
 
 ## Launch
 
-First replace every `YOUR_BUCKET` and the zero manifest digest in a copied run
-config. Static validation is laptop-safe:
+Bootstrap the accelerator-free controller environment. Once the actual
+dataset/seed hashes and measured topology exist, use
+`sunfish-render-tpu-configs` and `scripts/upload_tpu_configs.sh` as shown in
+`infra/tpu/README.md`; the renderer also requires the all-pass Stage-0 P1-P5
+report from the identical deployable source tree. The uploader atomically
+publishes that report with the three configs and their manifest. Do not
+hand-edit the reviewed templates. Perform static validation against the
+rendered controller copy:
 
 ```bash
-PYTHONPATH=src python3 -m sunfish_tpu.training.train \
-  --config configs/training/sunfish-smoke.toml \
+PYTHON_BIN=python3.12 VENV_DIR=.venv-tpu-controller \
+  scripts/bootstrap_tpu_controller.sh
+
+.venv-tpu-controller/bin/sunfish-train \
+  --config "$SMOKE_LOCAL_CONFIG" \
   --validate-only
 ```
 
@@ -178,28 +261,35 @@ Launch the identical command on every worker:
 
 ```bash
 scripts/launch_tpu_pod.sh \
-  --run-id sunfish-stage05-smoke \
-  --config configs/training/sunfish-smoke.toml \
+  --run-id "$SMOKE_RUN_ID" \
+  --config "$SMOKE_LOCAL_CONFIG" \
+  --remote-config "$SMOKE_REMOTE_CONFIG" \
   -- \
   .venv-tpu/bin/sunfish-train \
-  --config configs/training/sunfish-smoke.toml
+  --config "$SMOKE_REMOTE_CONFIG"
 ```
 
-Re-running that exact command against the same workdir is the supported
-preemption recovery path. Changing the TOML requires a new run ID/workdir.
+Re-running that exact command against the same workdir is the supported normal
+recovery path. The destructive gate-7 proof uses
+`sunfish-preemption-smoke.toml` and `sunfish-preemption-gate` with its own
+fresh workdir, so it cannot mistake a previously completed gate-4 run for a
+successful recovery. Gate 6 similarly uses `sunfish-resume-smoke.toml` and an
+empty workdir. Changing any other TOML field requires a new run ID/workdir.
 
 ## Stage-0.5 mapping
 
 | Ordered gate | Harness mechanism | Pass condition |
 | --- | --- | --- |
-| 1. topology/collective | distributed-init-first launcher + preflight | run on granted slice |
-| 2. disjoint GCS input | Grain process slice before shuffle; record IDs retained | prove no overlap and acceptable reads |
-| 3. sharded seed load | `ShardedOrbaxInitLoader` target shardings | measure no per-host full replication |
-| 4. 100-500 update smoke | `phase = "smoke"` validation | real tiny dataset/model run |
-| 5. save/restore | model/optimizer/step + deterministic RNG seed + Grain iterator | distributed GCS round trip |
-| 6. exact resume | existing synthetic checkpoint smoke plus interrupted real run | next batch/loss/grad/update exact |
-| 7. preemption | restart same all-host command/workdir | no cleanup or manual cursor edits |
-| 8. throughput | record-source timing during smoke | accelerator is not GCS-starved |
+| 1. topology/collective | `sunfish-topology-smoke` via distributed-init-first all-host launcher | every host and real `psum` pass |
+| 2. disjoint GCS input | `sunfish-input-smoke` runs the production Grain/Kauldron process slice, persists every host's record IDs, and merges exact coverage | `summary.json`: no overlap, no missing IDs, one manifest |
+| 3. sharded seed load | `sunfish-seed-load-smoke` restores the real 8B seed into Phase-B target shardings | exact tree/shardings; each host/device resident bytes below a full model |
+| 4. 100-500 update smoke | `phase = "smoke"` + `sunfish-smoke-evidence` | ≥100 contiguous steps, finite/nonzero norms, ≥10% tiny-set loss reduction |
+| 5. save/restore | `sunfish-checkpoint-smoke` distributed composite state | every host observes exact GCS round trip |
+| 6. exact resume | `sunfish-real-resume-smoke` on the production model/optimizer/Grain/Orbax path | next batch/loss/trainable grad+update+params/full optimizer+collections+step exact; base frozen |
+| 7. preemption | `sunfish-preemption-gate` on a fresh identical-lineage workdir | finalized checkpoint survives exact-attempt kill; unchanged relaunch starts its metric stream at the saved step rather than step 0 and completes without cleanup |
+| 8. throughput | real trainer iterator waits divided by accelerator step time | p95 ≤10%, zero local cache |
 
 No row in this table is a hardware pass until its evidence is recorded from
-the granted slice.
+the granted slice. `sunfish-readiness-ledger` hashes and validates all rows;
+it also re-runs the embedded host-evidence mergers and binds the rendered
+config bundle plus Stage-0 report. Only its `passed: true` unlocks Stage 1.

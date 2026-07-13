@@ -1,0 +1,4 @@
+# Minimal exact controller environment. It reads/writes GCS evidence, lists
+# object generation/CRC metadata, and invokes gcloud; it never imports JAX.
+etils[epath-gcs]==1.14.0
+google-cloud-storage==3.12.1

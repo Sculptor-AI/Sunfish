@@ -28,7 +28,7 @@ pad_token = 0
 eos_token = 1
 shuffle = true
 num_workers = 8
-verify_shard_hashes = false
+verify_shard_hashes = true
 
 [objective]
 noise_draws = 1
@@ -60,9 +60,14 @@ log_metrics_every_steps = 1
 log_summaries_every_steps = 25
 
 [checkpoint]
-init_path = "gs://YOUR_BUCKET/sunfish/checkpoints/sunfish-32e4-orbax"
+# This is the readiness-only first-32 seed produced from
+# stage05-first32-selection.json. It must never seed research or release runs.
+init_path = "gs://YOUR_BUCKET/sunfish/checkpoints/sunfish-stage05-first32-exact-tree"
 format = "orbax-exact-tree"
 model_param_path = "gemma_network.gemma_model"
+init_manifest_path = "gs://YOUR_BUCKET/sunfish/checkpoints/sunfish-stage05-first32-exact-tree.json"
+# Replace with sha256(init_manifest_path); zeros remain parseable but cannot run.
+init_manifest_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 
 [topology]
 require_tpu = true

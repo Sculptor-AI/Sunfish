@@ -150,6 +150,29 @@ def add_vision_only_middle_shard(source: Path) -> tuple[str, str, str]:
 
 
 class ConversionTests(unittest.TestCase):
+    def test_selection_top_k_cannot_cross_an_ablation_rung(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = make_checkpoint(root)
+            selection = root / "selection.json"
+            selection.write_text(
+                json.dumps(
+                    {
+                        "source_experts": 4,
+                        "retained_experts": 2,
+                        "top_k_experts": 2,
+                        "layers": {"0": [0, 1], "1": [0, 1]},
+                    }
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "top_k_experts"):
+                build_plan(
+                    source,
+                    retained_experts=2,
+                    top_k=1,
+                    selection_path=selection,
+                )
+
     def test_text_only_pruning_slices_axis_zero_and_rebuilds_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

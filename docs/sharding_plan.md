@@ -67,6 +67,12 @@ AdamW fp32 (m, v) + fp32 master ≈ 97 GB of state → FSDP:
 - No spec in this file survives contact with readiness tests #1/#3 without
   re-measurement; the tests are the authority, this document is the intent.
 
+Readiness test #3 is now a separate real-seed diagnostic rather than the
+Phase-A LoRA smoke: `sunfish-seed-load-smoke` restores the actual 8.11B
+exact-tree seed directly into this Phase-B policy and records target-sharding
+equality plus resident bytes per host/device. The ordinary smoke remains
+replicated by design and cannot substitute for that proof.
+
 ## Open questions (answered by the gauntlet, not by assumption)
 
 1. v4 megacore: is `jax.device_count()` 32 or 64 on this slice? (Affects

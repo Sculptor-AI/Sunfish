@@ -1,4 +1,6 @@
 from pathlib import Path
+import subprocess
+import sys
 import tomllib
 import unittest
 
@@ -63,6 +65,11 @@ class TpuDependencyLockTests(unittest.TestCase):
         self.assertNotIn("gemma @", base)
         self.assertRegex(source, r"gemma @ .*@[0-9a-f]{40}")
         self.assertIn("--no-deps --requirement requirements-gemma-source.lock", bootstrap)
+        self.assertIn("sunfish-runtime-api-audit", bootstrap)
+        self.assertLess(
+            bootstrap.index("sunfish-runtime-api-audit"),
+            bootstrap.index("sunfish-tpu-preflight"),
+        )
 
     def test_runtime_contract_matches_every_direct_distribution(self):
         root = Path(__file__).resolve().parents[1]
@@ -79,6 +86,55 @@ class TpuDependencyLockTests(unittest.TestCase):
                 name = requirement_name.split("[", 1)[0]
                 pins[name] = version
         self.assertEqual(pins, {**RUNTIME_VERSIONS, **TPU_ONLY_RUNTIME_VERSIONS})
+
+    def test_controller_environment_stays_accelerator_free_and_exact(self):
+        root = Path(__file__).resolve().parents[1]
+        lines = {
+            line
+            for line in (root / "requirements-controller.lock")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line and not line.startswith("#")
+        }
+        self.assertEqual(
+            lines,
+            {
+                "etils[epath-gcs]==1.14.0",
+                "google-cloud-storage==3.12.1",
+            },
+        )
+        with (root / "pyproject.toml").open("rb") as source:
+            project = tomllib.load(source)
+        self.assertEqual(
+            set(project["project"]["optional-dependencies"]["controller"]),
+            lines,
+        )
+        bootstrap = (root / "scripts/bootstrap_tpu_controller.sh").read_text()
+        self.assertIn("--no-deps --editable .", bootstrap)
+        self.assertIn("parity_evidence", bootstrap)
+        self.assertIn("validate_readiness_unlock", bootstrap)
+        for forbidden in ("jax", "libtpu", "flax", "kauldron", "orbax"):
+            self.assertNotIn(forbidden + "==", "\n".join(lines))
+
+    def test_controller_gate_imports_do_not_import_accelerator_stack(self):
+        root = Path(__file__).resolve().parents[1]
+        program = """
+import sys
+from sunfish_tpu import deployment_config, parity_evidence, readiness_ledger
+for name in ('jax', 'flax', 'kauldron', 'orbax'):
+    assert name not in sys.modules, (name, sorted(k for k in sys.modules if k.startswith(name)))
+assert callable(deployment_config.main)
+assert callable(parity_evidence.validate_stage0_parity_report)
+assert callable(readiness_ledger.validate_readiness_unlock)
+"""
+        subprocess.run(
+            [sys.executable, "-c", program],
+            cwd=root,
+            env={"PYTHONPATH": "src"},
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
 
 if __name__ == "__main__":

@@ -8,6 +8,8 @@ import hashlib
 import json
 import struct
 import sys
+import threading
+import time
 from array import array
 from bisect import bisect_right
 from collections.abc import Sequence
@@ -15,6 +17,7 @@ from typing import Any
 
 from etils import epath
 from grain import python as grain
+from kauldron.data import iterators as kd_iterators
 from kauldron.data.py import base as kd_data_base
 import numpy as np
 
@@ -24,6 +27,36 @@ from sunfish_tpu.training.record_format import TrainingRecord, decode_record
 
 _OFFSET = struct.Struct("<Q")
 _TOKEN_BYTES = 4
+_INPUT_WAIT_LOCK = threading.Lock()
+_INPUT_WAIT_SAMPLES: list[float] = []
+
+
+def consume_input_wait_metrics() -> dict[str, float | int]:
+    """Return and reset main-process iterator wait samples since last log."""
+    with _INPUT_WAIT_LOCK:
+        samples = tuple(_INPUT_WAIT_SAMPLES)
+        _INPUT_WAIT_SAMPLES.clear()
+    total = sum(samples)
+    return {
+        "samples": len(samples),
+        "total_seconds": total,
+        "mean_seconds": total / len(samples) if samples else 0.0,
+        "max_seconds": max(samples, default=0.0),
+    }
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class TimedPyGrainIterator(kd_iterators.PyGrainIterator):
+    """Checkpoint-compatible PyGrain iterator with main-process wait timing."""
+
+    def __next__(self):
+        started = time.perf_counter()
+        try:
+            return super().__next__()
+        finally:
+            elapsed = time.perf_counter() - started
+            with _INPUT_WAIT_LOCK:
+                _INPUT_WAIT_SAMPLES.append(elapsed)
 
 
 def manifest_sha256(directory: str) -> str:
@@ -66,6 +99,9 @@ class EPathShardedRecordSource(grain.RandomAccessDataSource):
         # prohibitive for the full coding/agent corpus.
         self._shards: list[tuple[str, array]] = []
         self._cumulative_records: list[int] = []
+        self._records_read = 0
+        self._payload_bytes_read = 0
+        self._range_read_seconds = 0.0
         total_records = 0
         total_tokens = 0
         for shard in manifest.get("shards", ()):
@@ -110,6 +146,30 @@ class EPathShardedRecordSource(grain.RandomAccessDataSource):
     def __len__(self) -> int:
         return self._cumulative_records[-1]
 
+    @property
+    def read_metrics(self) -> dict[str, float | int]:
+        """Best-effort per-process range-read counters for readiness evidence.
+
+        Multiprocessing workers own independent source copies, so production
+        training should treat these as host/source diagnostics rather than a
+        globally synchronized metric. The Stage-0.5 input smoke runs without
+        workers and records an exact per-host baseline.
+        """
+        seconds = self._range_read_seconds
+        return {
+            "records_read": self._records_read,
+            "payload_bytes_read": self._payload_bytes_read,
+            "range_read_seconds": seconds,
+            "mean_range_read_ms": (
+                seconds * 1000.0 / self._records_read if self._records_read else 0.0
+            ),
+            "payload_mib_per_second": (
+                self._payload_bytes_read / (1024.0 * 1024.0) / seconds
+                if seconds > 0.0
+                else 0.0
+            ),
+        }
+
     def __getitem__(self, record_key: int) -> array:
         if not 0 <= record_key < len(self):
             raise IndexError(record_key)
@@ -122,11 +182,16 @@ class EPathShardedRecordSource(grain.RandomAccessDataSource):
         start = int(offsets[local_index - 1]) if local_index else 0
         end = int(offsets[local_index])
         byte_count = (end - start) * _TOKEN_BYTES
+        started = time.perf_counter()
         with epath.Path(path_string).open("rb") as source:
             source.seek(start * _TOKEN_BYTES)
             payload = source.read(byte_count)
+        elapsed = time.perf_counter() - started
         if len(payload) != byte_count:
             raise IOError(f"short range read for record {record_key} from {path_string}")
+        self._records_read += 1
+        self._payload_bytes_read += len(payload)
+        self._range_read_seconds += elapsed
         words = array("I")
         words.frombytes(payload)
         if sys.byteorder != "little":
@@ -165,6 +230,10 @@ class TrainingRecordSource(grain.RandomAccessDataSource):
     @property
     def manifest_sha256(self) -> str:
         return self._source.manifest_sha256
+
+    @property
+    def read_metrics(self) -> dict[str, float | int]:
+        return self._source.read_metrics
 
     def __len__(self) -> int:
         return len(self._source)
@@ -216,6 +285,12 @@ class SunfishData(kd_data_base.DataSourceBase):
             pad_token=self.pad_token,
             eos_token=self.eos_token,
         )
+
+    def __iter__(self) -> kd_iterators.Iterator:
+        base = super().__iter__()
+        if not isinstance(base, kd_iterators.PyGrainIterator):
+            raise TypeError(f"expected PyGrainIterator, got {type(base)!r}")
+        return TimedPyGrainIterator(source=base.source, iter=base.iter)
 
 
 def pack_diffusion_example(

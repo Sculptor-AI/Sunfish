@@ -3,6 +3,7 @@ __pycache__/
 .DS_Store
 .venv/
 .venv-tpu/
+.venv-*/
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
@@ -13,6 +14,8 @@ data/
 runs/
 wandb/
 tpu-environment*.txt
+tpu-launch-logs/
+sunfish-logs/
 infra/tpu/job.env
 
 # agentwire mutable state (config + glossary ARE committed)

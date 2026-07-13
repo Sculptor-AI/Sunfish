@@ -84,8 +84,13 @@ class TrainingDataPipelineTests(unittest.TestCase):
     def test_compact_index_crosses_shard_boundary(self):
         source = self.make_source()
         self.assertEqual(len(source), 2)
-        self.assertEqual(int(source[1]["record_id"]), 1)
-        self.assertEqual(source[1]["canvas"][:2, 0].tolist(), [9, 10])
+        example = source[1]
+        self.assertEqual(int(example["record_id"]), 1)
+        self.assertEqual(example["canvas"][:2, 0].tolist(), [9, 10])
+        metrics = source.read_metrics
+        self.assertEqual(metrics["records_read"], 1)
+        self.assertGreater(metrics["payload_bytes_read"], 0)
+        self.assertGreaterEqual(metrics["range_read_seconds"], 0.0)
 
 
 if __name__ == "__main__":

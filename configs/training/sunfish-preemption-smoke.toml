@@ -1,0 +1,73 @@
+schema_version = 1
+
+# Gate 7 deliberately uses a fresh run identity/workdir. Keep every model,
+# dataset, seed, checkpoint, and topology field identical to sunfish-smoke.toml.
+[run]
+run_id = "sunfish-stage05-preemption"
+phase = "smoke"
+workdir = "gs://YOUR_BUCKET/sunfish/runs/stage05-preemption"
+seed = 20260711
+
+[model]
+num_experts = 32
+top_k_experts = 4
+vocab_size = 262144
+hidden_size = 2816
+num_layers = 30
+expert_hidden_size = 704
+dtype = "bfloat16"
+
+[data]
+directory = "gs://YOUR_BUCKET/sunfish/data/tiny-overfit-v1"
+manifest_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+global_batch_size = 32
+prompt_length = 512
+canvas_size = 256
+num_canvases = 1
+pad_token = 0
+eos_token = 1
+shuffle = true
+num_workers = 8
+verify_shard_hashes = true
+
+[objective]
+noise_draws = 1
+time_sampling = "prefix_stratified"
+self_condition_probability = 0.5
+decoder_loss_weight = 1.0
+encoder_loss_weight = 1.0
+stop_gradient_from_denoiser_to_encoder = false
+safety_epsilon = 0.0001
+logit_normal_mean = 0.0
+logit_normal_scale = 1.0
+
+[optimizer]
+peak_learning_rate = 0.00015
+end_learning_rate = 0.000015
+warmup_steps = 10
+weight_decay = 0.0001
+gradient_clip_norm = 1.0
+adam_beta1 = 0.95
+adam_beta2 = 0.99
+adam_epsilon = 0.00000001
+lora_rank = 16
+
+[training]
+steps = 100
+checkpoint_every_steps = 25
+max_checkpoints_to_keep = 3
+log_metrics_every_steps = 1
+log_summaries_every_steps = 25
+
+[checkpoint]
+init_path = "gs://YOUR_BUCKET/sunfish/checkpoints/sunfish-stage05-first32-exact-tree"
+format = "orbax-exact-tree"
+model_param_path = "gemma_network.gemma_model"
+init_manifest_path = "gs://YOUR_BUCKET/sunfish/checkpoints/sunfish-stage05-first32-exact-tree.json"
+init_manifest_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[topology]
+require_tpu = true
+expected_devices = 32
+expected_processes = 8
+expected_local_devices = 4

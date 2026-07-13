@@ -85,6 +85,12 @@ environments = ["swe-smith", "r2e-gym", "terminal-harbor", "mcp-simulated"]
 # first gate; layer-output reconstruction error is the decisive safety metric.
 min_coverage_relative_to_uniform = 0.9
 target_tokens_millions = 75
+reconstruction_sample_tokens = 100000
+reconstruction_min_tokens_per_bucket = 4000
+# Both bounds apply independently to every phase/workload bucket and layer.
+# The 48E fallback uses the same normalized output-quality bounds.
+reconstruction_max_relative_rmse = 0.15
+reconstruction_min_cosine_similarity = 0.99
 
 [calibration.bucket_weights]
 code_completion = 1.0

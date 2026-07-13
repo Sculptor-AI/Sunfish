@@ -15,9 +15,10 @@ on these answers.
    a bonus.)
 4. **Project ID** the quota lands in, and whether we get owner/editor on it
    or work inside someone else's project with a service account.
-5. **TPU VM host specs**: host RAM matters to us specifically — we want to
-   run a 26B bf16 parity check on the host CPU day 1 (needs ~60+ GB RAM;
-   v4 hosts typically have hundreds, just confirm).
+5. **CPU VM path**: can we provision or receive credits for a separate
+   high-memory CPU VM with at least 160 GB RAM? Stage-0 same-framework parity
+   and exact-tree seed materialization load the 25B teacher off-TPU; TPU workers
+   consume only the finished GCS seed and must not become conversion machines.
 6. **Egress or org-policy restrictions**: can the TPU VM reach Hugging Face
    and PyPI for bootstrap? Any VPC-SC / org policy that blocks external
    pulls?
@@ -49,8 +50,10 @@ settles it.
 
 ## What you can tell him we've already done (context, if he asks)
 
-Checkpoint downloaded and audited to the parameter, conversion pipeline
-built, cross-reviewed by two independent models, and executed cleanly on the
-real 52 GB weights; training/data/eval plans locked with gates; storage
-lifecycle and cost guardrails written. The window starts productive on
-day 1 — his compute won't idle while we set up.
+Checkpoint downloaded and audited to the parameter; static conversion P1 is
+691/691, while the high-memory P2-P5 model-forward parity run remains explicit
+pre-TPU work. The multi-host trainer, immutable configs, exact-tree seed path,
+data loader, checkpoint/resume/preemption proofs, and eight-gate evidence
+ledger are implemented and locally tested. Hardware passes are not claimed
+until the granted slice emits the ledger. Storage lifecycle and cost
+guardrails are written, so the window can start with the ordered gauntlet.

@@ -15,6 +15,7 @@ class TrainingSpecTests(unittest.TestCase):
         router = HarnessConfig.load(ROOT / "configs/training/sunfish-router.toml")
         recovery = HarnessConfig.load(ROOT / "configs/training/sunfish-recovery.toml")
         self.assertEqual(smoke.run.phase, Phase.SMOKE)
+        self.assertEqual(len(smoke.checkpoint.init_manifest_sha256), 64)
         self.assertEqual(router.run.phase, Phase.ROUTER)
         self.assertEqual(recovery.run.phase, Phase.LORA)
         self.assertEqual(
@@ -63,6 +64,17 @@ class TrainingSpecTests(unittest.TestCase):
             checkpoint=dataclasses.replace(config.checkpoint, init_step=-1),
         )
         with self.assertRaisesRegex(ValueError, "explicit Kauldron step"):
+            invalid.validate()
+
+    def test_exact_tree_seed_manifest_is_required(self):
+        config = HarnessConfig.load(ROOT / "configs/training/sunfish-smoke.toml")
+        invalid = dataclasses.replace(
+            config,
+            checkpoint=dataclasses.replace(
+                config.checkpoint, init_manifest_sha256=""
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "init_manifest_sha256"):
             invalid.validate()
 
 
