@@ -156,7 +156,7 @@ def run_preemption_gate(
     remote_config = os.environ.get("SUNFISH_REMOTE_CONFIG", str(config_path))
     root = Path(__file__).resolve().parents[2]
     launcher = root / "scripts/launch_tpu_pod.sh"
-    killer = root / "scripts/kill_tpu_attempt.sh"
+    interrupter = root / "scripts/interrupt_training_attempt.sh"
 
     def launch_command(attempt: str) -> list[str]:
         return [
@@ -182,8 +182,8 @@ def run_preemption_gate(
         "started_at": _utc_now(),
         "commands": {
             "preempt_launch": launch_command(preempt_attempt),
-            "kill": [
-                str(killer),
+            "interrupt_training_processes": [
+                str(interrupter),
                 "--run-id",
                 config.run.run_id,
                 "--attempt-id",
@@ -227,15 +227,17 @@ def run_preemption_gate(
             poll_seconds=poll_seconds,
             process=first,
         )
-        evidence["checkpoint_finalized_before_kill_at"] = _utc_now()
-        subprocess.run(evidence["commands"]["kill"], check=True)
+        evidence["checkpoint_finalized_before_process_interrupt_at"] = _utc_now()
+        subprocess.run(evidence["commands"]["interrupt_training_processes"], check=True)
         try:
             first_returncode = first.wait(timeout=120)
         except subprocess.TimeoutExpired as error:
             raise RuntimeError("preempted all-host launch did not exit") from error
         evidence["preempted_launch_returncode"] = first_returncode
         if first_returncode == 0:
-            raise RuntimeError("preempted launch exited zero; no real kill was observed")
+            raise RuntimeError(
+                "interrupted launch exited zero; no real process interruption was observed"
+            )
         if not _gcloud_exists(gcloud, plan["preempt_marker"]):
             raise RuntimeError("finalized checkpoint disappeared after preemption")
 

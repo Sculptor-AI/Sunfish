@@ -91,7 +91,7 @@ if [[ "$1 $2" == "storage cp" ]]; then
   cp "$3" "$state/evidence.json"
   exit 0
 fi
-if [[ "$1 $2 $3" == "compute tpus tpu-vm" ]]; then
+if [[ "$1 $2 $3 $4" == "alpha compute tpus tpu-vm" ]]; then
   command=""
   previous=""
   for argument in "$@"; do
@@ -166,7 +166,7 @@ exit 2
         config = HarnessConfig.load(ROOT / "configs/training/sunfish-smoke.toml")
         plan = build_preemption_plan(
             config,
-            preempt_attempt="kill-001",
+            preempt_attempt="interrupt-001",
             resume_attempt="resume-001",
             preempt_after_step=25,
         )

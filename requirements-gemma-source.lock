@@ -1,3 +1,4 @@
-# DiffusionGemma's training adapter is not present in the released gemma 4.0.1.
-# This exact upstream commit reports version 4.1.0 and contains the adapter.
+# Connected bundle-builder/off-TPU compute input only; never read on a TPU
+# worker. DiffusionGemma's adapter is absent from gemma 4.0.1. This exact
+# upstream commit reports version 4.1.0 and contains it.
 gemma @ git+https://github.com/google-deepmind/gemma.git@09e7b48ae88720f6236b8266c7213eb51bb62b87

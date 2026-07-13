@@ -14,9 +14,9 @@ dependencies = []
 
 [project.optional-dependencies]
 # Keep checkpoint conversion dependency-free. The TPU group follows the
-# compatibility lock in requirements-tpu.lock. Install it on TPU VMs, not on
-# deployment hosts. Keep every direct requirement exact here as well so an
-# accidental `pip install .[tpu]` cannot float the training stack.
+# compatibility contract in requirements-tpu.lock. This extra is packaging-
+# host metadata only: never run `pip install .[tpu]` on a TPU worker. Workers
+# install the immutable bundle-generated URL-free lock with `--no-index`.
 tpu = [
   "dialog==1.1.0",
   "etils[epath-gcs]==1.14.0",

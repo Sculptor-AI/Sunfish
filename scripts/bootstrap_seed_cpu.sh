@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# High-memory Linux CPU VM only. The seed materializer has its own RAM guard
-# and will refuse Chase's laptop even if this environment is created there.
+# CONNECTED high-memory Linux CPU VM only, never a TPU worker. The seed
+# materializer has its own RAM guard and refuses Chase's laptop.
+
+[[ -z "${SUNFISH_TPU_WORKER:-}" ]] || {
+  echo "seed materialization is forbidden on a TPU worker" >&2
+  exit 2
+}
+[[ "${1:-}" == "--connected-compute-host" && $# == 1 ]] || {
+  echo "usage: bootstrap_seed_cpu.sh --connected-compute-host" >&2
+  exit 2
+}
 PYTHON_BIN="${PYTHON_BIN:-python3.12}"
 VENV_DIR="${VENV_DIR:-.venv-seed}"
 ENVIRONMENT_RECORD="${ENVIRONMENT_RECORD:-seed-environment.txt}"

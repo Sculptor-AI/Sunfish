@@ -1,7 +1,7 @@
-# Install this resolver-visible base first. Gemma is installed separately with
-# --no-deps because its unreleased 4.1.0 source currently declares a floating
-# Hackable Diffusion git dependency. Sunfish pins Hackable Diffusion above and
-# refuses to let that source dependency move underneath a run.
+# Connected bundle-builder input only; TPU workers never read this resolver
+# lock. The builder downloads wheels, then emits a URL-free fully resolved
+# offline lock. Gemma is built separately because unreleased 4.1.0 declares a
+# floating Hackable Diffusion git dependency.
 
 dialog==1.1.0
 etils[epath-gcs]==1.14.0

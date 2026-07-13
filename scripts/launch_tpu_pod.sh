@@ -111,10 +111,6 @@ controller_log_dir="${SUNFISH_CONTROLLER_LOG_DIR:-tpu-launch-logs}/${run_id}/${a
 mkdir -p "${controller_log_dir}"
 printf '%s\n' "${remote_command}" > "${controller_log_dir}/remote-command.txt"
 
-gcloud_bin="${SUNFISH_GCLOUD_BIN:-gcloud}"
-"${gcloud_bin}" compute tpus tpu-vm ssh "${TPU_NAME}" \
-  --project "${PROJECT_ID}" \
-  --zone "${ZONE}" \
-  --worker=all \
-  --command "${remote_command}" \
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+"${script_dir}/tpu_iap.sh" ssh-all --command "${remote_command}" \
   2>&1 | tee "${controller_log_dir}/all-workers.log"

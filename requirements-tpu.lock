@@ -1,4 +1,6 @@
-# Sunfish TPU compatibility lock, resolved for CPython 3.12 on Linux x86_64.
+# Build-time direct compatibility contract for CPython 3.12/Linux x86_64.
+# TPU workers install the bundle-generated URL-free offline lock, never this
+# file (which records Gemma's exact source provenance).
 #
 # These are every load-bearing direct TPU dependency named by the allocation
 # review. JAX 0.10.2's TPU extra requires libtpu 0.0.42.*, hence 0.0.42.1

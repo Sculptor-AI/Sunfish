@@ -35,7 +35,8 @@ done
   echo "expected config SHA-256 is required" >&2
   exit 2
 }
-actual_config_sha256="$(python3 -c \
+system_python="${SUNFISH_REMOTE_PYTHON_BIN:-python3.12}"
+actual_config_sha256="$("${system_python}" -c \
   'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' \
   "${config}")"
 [[ "${actual_config_sha256}" == "${config_sha256}" ]] || {
@@ -61,16 +62,30 @@ fi
   echo "expected source-tree SHA-256 is required" >&2
   exit 2
 }
-actual_commit="$(git rev-parse HEAD)"
+read -r actual_commit actual_source_tree_sha256 < <(
+  PYTHONPATH=src "${system_python}" -c \
+    'import pathlib; from sunfish.source_tree import workspace_source_identity; i=workspace_source_identity(pathlib.Path.cwd()); print(i["git_commit"], i["source_tree_sha256"])'
+)
 [[ "${actual_commit}" == "${expected_commit}" ]] || {
-  echo "worker Git commit ${actual_commit} differs from ${expected_commit}" >&2
+  echo "worker release commit ${actual_commit} differs from ${expected_commit}" >&2
   exit 2
 }
-actual_source_tree_sha256="$(python3 scripts/source_tree_digest.py --root .)"
 [[ "${actual_source_tree_sha256}" == "${source_tree_sha256}" ]] || {
   echo "worker source tree differs from controller" >&2
   exit 2
 }
+if [[ -f .sunfish-release.json ]]; then
+  derived_bundle_root="$(cd .. && pwd)"
+  [[ -f "${derived_bundle_root}/offline-bundle.json" ]] || {
+    echo "exported worker source is not inside an offline bundle" >&2
+    exit 2
+  }
+  if [[ -n "${SUNFISH_OFFLINE_BUNDLE_ROOT:-}" && "${SUNFISH_OFFLINE_BUNDLE_ROOT}" != "${derived_bundle_root}" ]]; then
+    echo "worker offline bundle root differs from exported source parent" >&2
+    exit 2
+  fi
+  export SUNFISH_OFFLINE_BUNDLE_ROOT="${derived_bundle_root}"
+fi
 (($#)) || { echo "missing host command" >&2; exit 2; }
 
 export SUNFISH_RUN_ID="${run_id}"
@@ -81,6 +96,7 @@ export EXPECTED_TPU_DEVICES="${expected_devices}"
 export EXPECTED_TPU_PROCESSES="${expected_processes}"
 export SUNFISH_GIT_COMMIT="${actual_commit}"
 export SUNFISH_SOURCE_TREE_SHA256="${actual_source_tree_sha256}"
+export SUNFISH_TPU_WORKER=1
 if [[ -n "${expected_local_devices}" ]]; then
   export EXPECTED_LOCAL_TPU_DEVICES="${expected_local_devices}"
 fi

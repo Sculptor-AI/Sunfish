@@ -11,6 +11,12 @@ local devices per host, VM image/runtime, preemption policy, allocation dates,
 project, zone, attached service account, GCS bucket, and egress restrictions.
 Do not infer any of those from the phrase "v4-64".
 
+The allocated TPU VMs have **no public internet access**. All controller-to-
+worker SSH and SCP traffic goes through IAP, targets every worker, and uses the
+alpha TPU VM command surface. Sunfish never creates, starts, stops, resets,
+reboots, or deletes the allocation. Those lifecycle operations remain solely
+with the allocation owner; losing this non-preemptible pod could cost a month.
+
 The service account is restricted to the Sunfish GCS prefixes it needs:
 
 - immutable data manifests/shards (read);
@@ -34,7 +40,51 @@ for this same-framework conversion gate. The final report must come from the
 same deployable source identity that will be launched; every TPU launcher now
 rejects a config bundle without a strictly validated all-pass P1-P5 report.
 
-## Fully ordered bootstrap
+## Fully ordered air-gapped bootstrap
+
+### 1. Probe the base image, then build away from the TPU pod
+
+From the authenticated controller, first prove IAP reaches every worker and
+that the immutable VM image already supplies Linux x86_64 CPython 3.12,
+`venv`/`ensurepip`, safe tar extraction, and enough free disk. This probe does
+not import JAX or contact any network endpoint from a worker:
+
+```bash
+export TPU_NAME=YOUR_TPU_NAME
+export PROJECT_ID=YOUR_PROJECT
+export ZONE=YOUR_ZONE
+scripts/probe_tpu_worker_base.sh
+```
+
+The probe defaults to a 20 GiB free-space floor. Override
+`SUNFISH_MIN_FREE_BYTES` only from an allocation-owner-approved disk budget;
+the probe fails the all-worker command if any host is below it.
+
+If any worker lacks that base, stop here and ask the allocation owner for a
+compatible image; do not apt-install, reboot, reset, or recreate the pod. Use a
+connected packaging host with a compatible Linux/glibc ABI. Third-party
+runtime packages must arrive as prebuilt wheels; the builder refuses source
+distributions rather than compiling them against an accidental host ABI.
+
+Use an internet-connected Linux x86_64 CPython 3.12 packaging host such as
+Colab, Kaggle, Cloud Build, or a disposable CPU VM. Do not build this large
+wheelhouse on Chase's laptop, and never run the builder on a TPU worker:
+
+```bash
+# Clean committed checkout on the connected packaging host.
+scripts/build_tpu_offline_bundle.sh \
+  --connected-build-host \
+  --output /tmp/sunfish-tpu-offline-COMMIT.tar
+```
+
+The builder is the only TPU release path allowed to contact PyPI or GitHub. It
+resolves/builds Linux wheels, builds Gemma from the audited 40-character
+source commit, builds the Sunfish wheel, creates a fully resolved URL-free
+lock, reconstructs and audits a fresh environment with `PIP_NO_INDEX=1`, and
+emits the archive plus `.sha256` sidecar. Copy those two files back to the
+controller. The workers receive no credentials and resolve no dependencies.
+
+### 2. Configure the non-compute controller
 
 The controller is Chase's laptop, Cloud Shell, or another non-compute machine
 with the repository and authenticated `gcloud` CLI. It does not install JAX
@@ -46,31 +96,52 @@ PYTHON_BIN=python3.12 VENV_DIR=.venv-tpu-controller \
 export TPU_NAME=YOUR_TPU_NAME
 export PROJECT_ID=YOUR_PROJECT
 export ZONE=YOUR_ZONE
-export REMOTE_REPO_DIR=/home/YOUR_USER/sunfish-v2
+export SUNFISH_OFFLINE_ARCHIVE=/absolute/path/sunfish-tpu-offline-COMMIT.tar
+export SUNFISH_REMOTE_RELEASE_DIR=/home/YOUR_USER/sunfish-releases/COMMIT
 ```
 
 The controller launches every worker simultaneously and reads immutable GCS
 evidence. The TPU virtualenv below exists only on TPU workers.
 
-Before the first launch, commit and push the exact tree, then check out that
-commit in `REMOTE_REPO_DIR` on every worker. The launcher pins both the
-40-character Git commit and a deterministic SHA-256 over the deployable
+### 3. Deploy source and wheels to every worker through IAP
+
+```bash
+scripts/deploy_tpu_offline_bundle.sh \
+  --bundle "$SUNFISH_OFFLINE_ARCHIVE" \
+  --remote-dir "$SUNFISH_REMOTE_RELEASE_DIR"
+
+export REMOTE_REPO_DIR="$SUNFISH_REMOTE_RELEASE_DIR/source"
+export SUNFISH_OFFLINE_BUNDLE_ROOT="$SUNFISH_REMOTE_RELEASE_DIR"
+```
+
+The deployer performs exactly the transport pattern required by the
+allocation: `gcloud alpha compute tpus tpu-vm ssh --worker=all
+--batch-size=all --tunnel-through-iap` and `gcloud alpha compute tpus tpu-vm
+scp --worker=all --tunnel-through-iap`. The single archive is copied to every
+worker, SHA-256 checked there, safely unpacked, inventory-verified, and
+atomically published into a previously nonexistent release directory. It
+never contacts a package index and never invokes a TPU lifecycle operation.
+
+The launcher pins both the 40-character Git commit and a deterministic SHA-256 over the deployable
 surface: `src/`, `scripts/`, `configs/`, exact lock files, `pyproject.toml`,
 and the audited upstream reference. The hash includes tracked and non-ignored
 untracked entries, file contents, symlink targets, and permission bits. Mutable
 coordination history and prose docs are deliberately outside it. Each host
 recomputes both values before importing JAX and
-refuses the launch on any mismatch. This permits an intentional local patch
-only when the identical patch is present on every worker; a clean committed
-checkout is the operational default. Generated logs and virtualenvs are
-ignored and therefore do not perturb the identity.
+refuses the launch on any mismatch. The exported source carries a local
+`.sunfish-release.json`, so workers prove the identity without a Git checkout
+or GitHub access. Generated bytecode, logs, and virtualenvs are ignored and do
+not perturb the identity.
 
 The bootstrap uses Python 3.12, the exact TPU stack in
-`requirements-tpu-base.lock`, and exact Gemma source commit
-`09e7b48ae88720f6236b8266c7213eb51bb62b87`. Gemma is installed with
-`--no-deps` because its unreleased 4.1.0 metadata currently points at a
-floating Hackable Diffusion branch. The runtime checks `direct_url.json` and
-every direct version before training. Before any backend import, bootstrap also
+the bundle's `offline-requirements.lock` and exact Gemma source commit
+`09e7b48ae88720f6236b8266c7213eb51bb62b87`. Worker pip is forced to
+`PIP_NO_INDEX=1`, `--no-index`, `--no-deps`, `--only-binary=:all:`, and the
+local wheelhouse. `--no-deps` is mandatory because Gemma's wheel metadata
+contains an online Git dependency; every transitive distribution is already
+enumerated in the generated lock. The runtime checks the source-bound bundle
+manifest and every resolved installed version before training. Before any backend import,
+bootstrap also
 runs `sunfish-runtime-api-audit`: it parses the installed source files for the
 reviewed Gemma/Kauldron/Orbax private signatures and checkpoint/cursor/metric
 ordering, then records their file hashes in `tpu-runtime-api-audit.json`.
@@ -167,36 +238,33 @@ scripts/launch_tpu_pod.sh \
   --config "$SMOKE_LOCAL_CONFIG" \
   --remote-config "$SMOKE_REMOTE_CONFIG" \
   -- \
-  env "SUNFISH_GCS_WORKDIR=$SUNFISH_GCS_WORKDIR" scripts/bootstrap_tpu.sh
+  env \
+  "SUNFISH_GCS_WORKDIR=$SUNFISH_GCS_WORKDIR" \
+  "SUNFISH_OFFLINE_BUNDLE_ROOT=$SUNFISH_OFFLINE_BUNDLE_ROOT" \
+  scripts/bootstrap_tpu.sh
 ```
 
 Its ordering is
-binding: create environment → install exact stack → static runtime API audit →
-distributed JAX init → topology and real collective → GCS read/list probe →
-record `pip freeze`.
+binding: verify archive/source/wheel inventory → create environment → offline
+no-index wheel install → exact installed-environment comparison → static
+runtime API audit → distributed JAX init → topology and real collective → GCS
+read/list probe → record `pip freeze`.
 The first distributed checkpoint smoke is the write/read authorization probe.
 Do not import Kauldron or ask JAX for devices before distributed init.
 
-For an ordinary Cloud TPU VM, attach the service account explicitly:
-
-```bash
-gcloud compute tpus tpu-vm create "$TPU_NAME" \
-  --project "$PROJECT_ID" \
-  --zone "$ZONE" \
-  --accelerator-type "$ACCELERATOR_TYPE" \
-  --version "$TPU_RUNTIME" \
-  --service-account "$TPU_SERVICE_ACCOUNT" \
-  --scopes cloud-platform
-```
-
-Use internal IPs only after Private Google Access and the dependency-install
-path have both been tested.
+The allocation owner must attach the service account and scopes before handoff.
+Sunfish intentionally contains no allocation creation or mutation command.
 
 ## All-host launcher
 
 Every pod command goes through `scripts/launch_tpu_pod.sh`. It uses
-`gcloud ... --worker=all`, gives every host one run ID/config/command, records
+the guarded `scripts/tpu_iap.sh` wrapper, which expands to `gcloud alpha
+compute tpus tpu-vm ssh ... --worker=all --batch-size=all
+--tunnel-through-iap`. It gives every host one run ID/config/command, records
 the exact remote command, and keeps a separate host log and `pip freeze`.
+Config and release transfers use the matching all-worker IAP SCP form. The
+wrapper has no TPU lifecycle subcommand and rejects remote power/lifecycle
+commands before invoking `gcloud`.
 `scripts/tpu_host_entrypoint.sh` refuses a missing config or topology and
 rejects any worker whose commit or source-tree digest differs from the
 controller. It separately hashes the selected config bytes on the controller
@@ -383,7 +451,8 @@ scripts/launch_tpu_pod.sh \
 The rendered `sunfish-preemption-smoke.toml` has the same
 model/data/seed/topology but its own fresh run ID and empty workdir. The
 controller waits for Orbax's pinned
-`commit_success.txt` marker, kills only that exact attempt on every worker,
+`commit_success.txt` marker, sends SIGKILL only to the exact recorded training
+processes on every worker,
 proves the finalized checkpoint survived, and relaunches the unchanged config.
 No GCS deletion or cursor editing is permitted. The resumed attempt must emit
 its first process-0 metric at the checkpoint step (Kauldron's step-label
@@ -391,11 +460,17 @@ convention) and must not emit step 0; that metric's run/config/data/seed/source
 lineage is embedded in the gate evidence. This distinguishes a real restore
 from a silent full retrain that merely reaches the same final checkpoint.
 
+This gate never interrupts a TPU VM or allocation. The process helper verifies
+the PID belongs to the current worker user, the command line is exactly a
+`sunfish-train` entry point, and the run/attempt IDs match its
+`/proc/.../environ` before signaling it. All transport still passes through
+the lifecycle-blocking IAP wrapper.
+
 ```bash
 export SUNFISH_REMOTE_CONFIG="$PREEMPT_REMOTE_CONFIG"
 .venv-tpu-controller/bin/sunfish-preemption-gate \
   --config "$PREEMPT_LOCAL_CONFIG" \
-  --preempt-attempt "$PREEMPT_RUN_ID-kill-001" \
+  --preempt-attempt "$PREEMPT_RUN_ID-interrupt-001" \
   --resume-attempt "$PREEMPT_RUN_ID-recover-001" \
   --preempt-after-step 25 \
   --evidence-uri "$SUNFISH_READINESS/preemption/summary.json"
@@ -442,7 +517,8 @@ real resume gates.
 - Default retention is three full checkpoints; interval comes from the strict
   run TOML and is converted from the approved wall-clock target after the
   throughput smoke.
-- Clean shutdown waits for async finalization. Abrupt preemption loses only
+- Clean training-process exit waits for async finalization. Abrupt process
+  interruption loses only
   work after the last finalized checkpoint; restart restores automatically.
 - No multi-hour job starts before the real exact-resume comparison passes.
 

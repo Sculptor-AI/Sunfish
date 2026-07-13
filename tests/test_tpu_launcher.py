@@ -2,6 +2,7 @@ import os
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -74,6 +75,9 @@ class AllHostLauncherTests(unittest.TestCase):
             calls = capture.read_text(encoding="utf-8")
             self.assertEqual(calls.count("CALL\n"), 12)
             self.assertEqual(calls.count("--worker=all\n"), 12)
+            self.assertEqual(calls.count("--tunnel-through-iap\n"), 12)
+            self.assertEqual(calls.count("--batch-size=all\n"), 7)
+            self.assertEqual(calls.count("alpha\n"), 12)
             self.assertIn("tpu-vm\nscp\n", calls)
             self.assertIn("sunfish-preemption-smoke.toml", calls)
             self.assertIn("/home/sunfish/deploy/grant-001", calls)
@@ -168,7 +172,10 @@ class AllHostLauncherTests(unittest.TestCase):
                 text=True,
             )
             arguments = capture.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(arguments[:5], ["alpha", "compute", "tpus", "tpu-vm", "ssh"])
             self.assertIn("--worker=all", arguments)
+            self.assertIn("--batch-size=all", arguments)
+            self.assertIn("--tunnel-through-iap", arguments)
             command = arguments[arguments.index("--command") + 1]
             self.assertIn("20260711-smoke", command)
             self.assertIn("--attempt-id attempt-001", command)
@@ -179,7 +186,7 @@ class AllHostLauncherTests(unittest.TestCase):
             self.assertRegex(command, r"--expected-commit [0-9a-f]{40}")
             self.assertRegex(command, r"--source-tree-sha256 [0-9a-f]{64}")
 
-    def test_preemption_kill_targets_only_one_attempt_on_all_workers(self):
+    def test_preemption_interrupt_targets_only_one_attempt_on_all_workers(self):
         root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as temporary:
             temporary_path = Path(temporary)
@@ -201,11 +208,11 @@ class AllHostLauncherTests(unittest.TestCase):
             subprocess.run(
                 [
                     "bash",
-                    str(root / "scripts" / "kill_tpu_attempt.sh"),
+                    str(root / "scripts" / "interrupt_training_attempt.sh"),
                     "--run-id",
                     "sunfish-smoke",
                     "--attempt-id",
-                    "kill-001",
+                    "interrupt-001",
                 ],
                 cwd=root,
                 env=environment,
@@ -214,11 +221,17 @@ class AllHostLauncherTests(unittest.TestCase):
                 text=True,
             )
             arguments = capture.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(arguments[:5], ["alpha", "compute", "tpus", "tpu-vm", "ssh"])
             self.assertIn("--worker=all", arguments)
+            self.assertIn("--batch-size=all", arguments)
+            self.assertIn("--tunnel-through-iap", arguments)
             command = arguments[arguments.index("--command") + 1]
-            self.assertIn("sunfish-smoke.kill-001.", command)
+            self.assertIn("sunfish-smoke.interrupt-001.", command)
             self.assertIn("*.pid", command)
-            self.assertIn("kill -KILL", command)
+            self.assertIn("/bin/kill -KILL", command)
+            self.assertIn("/proc/${pid}/environ", command)
+            self.assertIn("/proc/${pid}/cmdline", command)
+            self.assertIn("sunfish-train", command)
 
     def test_host_entrypoint_writes_a_per_host_log(self):
         root = Path(__file__).resolve().parents[1]
@@ -229,6 +242,7 @@ class AllHostLauncherTests(unittest.TestCase):
                 "SUNFISH_HOST_LOG_ROOT": str(log_root),
                 "SUNFISH_PID_ROOT": str(Path(temporary) / "pids"),
                 "SUNFISH_PYTHON_BIN": str(Path(temporary) / "missing-python"),
+                "SUNFISH_REMOTE_PYTHON_BIN": sys.executable,
             }
             expected_commit = subprocess.run(
                 ["git", "rev-parse", "HEAD"],
@@ -278,7 +292,7 @@ class AllHostLauncherTests(unittest.TestCase):
                     "--",
                     "bash",
                     "-c",
-                    "echo host-command-ran",
+                    "test \"$SUNFISH_TPU_WORKER\" = 1 && echo host-command-ran",
                 ],
                 cwd=root,
                 env=environment,
@@ -338,6 +352,7 @@ class AllHostLauncherTests(unittest.TestCase):
                     str(marker),
                 ],
                 cwd=root,
+                env={**os.environ, "SUNFISH_REMOTE_PYTHON_BIN": sys.executable},
                 check=False,
                 capture_output=True,
                 text=True,

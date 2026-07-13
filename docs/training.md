@@ -1,8 +1,9 @@
 # Sunfish training and infrastructure plan
 
-Status: infrastructure scaffold implemented; TPU allocation/topology pending
-confirmation. Dollar figures are planning envelopes, not quotes; pilot runs
-exist to replace them with measurements.
+Status: infrastructure scaffold implemented; the handed-off TPU pod is
+non-preemptible and must not be lifecycle-mutated, while its exact JAX
+topology/counts still require live measurement. Dollar figures are planning
+envelopes, not quotes; pilot runs exist to replace them with measurements.
 
 ## Framework decision: JAX-first training
 
@@ -24,11 +25,11 @@ windows. The TPU time is free; the project pays only incidentals (GCS storage,
 checkpoint egress, and any fallback compute; the accepted run-profile storage
 envelope is detailed below).
 
-**Allocation status: 32×v4 (64 cores) requested; exact granted topology still
-pending confirmation.** `infra/tpu/README.md` makes global device, process, and
-local-device counts measured inputs; do not infer their JAX values or host
-layout from the request. The eight-gate readiness gauntlet runs on the granted
-slice before calibration or training. Smaller Colab/Kaggle TPU sessions remain
+**Planning target: 32×v4 (64 cores); the current pod is non-preemptible, but
+its exact granted topology is not inferred from that label.**
+`infra/tpu/README.md` makes global device, process, and local-device counts
+measured inputs. The eight-gate readiness gauntlet runs on the granted slice
+before calibration or training. Smaller Colab/Kaggle TPU sessions remain
 useful for isolated warm-up tests, not as evidence for the granted topology.
 
 Fit by phase:
@@ -49,8 +50,9 @@ Constraints to plan around:
 - Quota is best-effort and window-based; renewals expect research feedback and
   an acknowledgment in anything published. Treat each window as a deadline:
   have data, code, and pilot results ready *before* the window opens.
-- Most quota is preemptible, so the checkpoint hygiene rules below apply
-  unchanged — Orbax saves to GCS every 30-60 minutes with tested exact-resume.
+- Other TRC/fallback quota can be preemptible, so checkpoint hygiene still
+  matters. The current scarce pod is non-preemptible: recovery is tested by
+  interrupting only a recorded `sunfish-train` user process, never a TPU VM.
 - TPUs do not help the deployment story: quantized inference benchmarking,
   entropy-selection stability under int4/NVFP4, and the agent-latency gate
   stay on the RTX 5080 and M5.
@@ -132,8 +134,9 @@ and student fit together with useful batch size on an unknown TPU topology:
 **What either fallback deliberately preserves** — do not cut these:
 checkpoint *frequency* (30-60 min; preemption safety), the tested
 exact-resume path, off-device
-scalar metrics (W&B free tier — tiny and they are the forensic record that
-deleted checkpoints can no longer provide), decontamination reports and eval
+scalar metrics in GCS (optionally mirrored to W&B by the controller — they are
+the forensic record that deleted checkpoints can no longer provide),
+decontamination reports and eval
 outputs for the tech report (small), and one debug sample per deleted log
 class.
 
@@ -170,10 +173,12 @@ not merely documentation.
   time — Orbax to GCS on TRC, network volume plus a private Hugging Face repo
   (or B2/R2 bucket) on RunPod — so a preempted device loses at most one
   interval.
-- Exact-resume is a tested code path (the existing gate), not a hope: kill a
-  pilot run mid-step and verify loss-curve continuity before the paid run.
-- Log router-mass, held-out diffusion loss, and eval metrics to a hosted
-  tracker (W&B free tier) so a dead pod doesn't take its telemetry with it.
+- Exact-resume is a tested code path (the existing gate), not a hope:
+  interrupt only the recorded user-space pilot processes mid-step and verify
+  loss-curve continuity. Never stop or reboot a TPU VM for this test.
+- Write router-mass, held-out diffusion loss, and eval metrics to the run's GCS
+  prefix. The controller may mirror them to a hosted tracker later; workers
+  have no public internet access.
 
 ## RTX 5080 inference notes
 

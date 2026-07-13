@@ -19,9 +19,11 @@ precise punch list and catches three traps we had not seen.
    module import time. `python -m kauldron.main` on a pod is unsafe. We need
    a custom launcher that initializes distributed JAX before importing
    anything Kauldron-adjacent.
-3. **No all-host launcher**: bootstrap/preflight run in one shell. Multi-host
-   requires `gcloud compute tpus tpu-vm ssh --worker=all` (same program,
-   same run ID/config/paths, every worker) with per-host logs.
+3. **No all-host IAP launcher**: bootstrap/preflight run in one shell. This
+   allocation has no public worker egress or direct SSH. Multi-host requires
+   `gcloud alpha compute tpus tpu-vm ssh --worker=all --batch-size=all
+   --tunnel-through-iap` (same program, same run ID/config/paths, every
+   worker), matching all-worker IAP SCP for files, and per-host logs.
 
 ## Architecture corrections (accepted)
 
@@ -64,8 +66,9 @@ precise punch list and catches three traps we had not seen.
    state from GCS.
 6. Exact resume: next batch, loss, gradients, updated params identical to an
    uninterrupted control after restart.
-7. Preemption: kill a real run between checkpoints; automatic recovery, no
-   manual GCS cleanup.
+7. Recovery: interrupt only the exact recorded user-space training processes
+   between checkpoints; automatic recovery, no manual GCS cleanup, and no TPU
+   VM lifecycle action.
 8. Input throughput: TPU not starved by GCS reads; local disk bounded.
 
 No v4-64 job runs before all eight pass, in order.
@@ -84,7 +87,7 @@ and the real GCS prefix can do that.
 | 4. real training smoke | Executable: strict 100–500 update Kauldron trainer plus immutable per-step loss/gradient/update evidence and 10% tiny-set overfit criterion | Not run |
 | 5. distributed checkpoint | Executable: collective Phase-B synthetic Orbax proof plus production Kauldron checkpointer | Not run |
 | 6. exact resume | Executable: `sunfish-real-resume-smoke` compares production next batch/loss/trainable gradients+updates+params/full optimizer+collections/step and frozen-base invariance | Not run |
-| 7. preemption | Executable controller waits for pinned Orbax commit marker, kills an exact all-host attempt, relaunches unchanged, and proves the new attempt's first metric continues at the saved step rather than step 0 | Not run |
+| 7. preemption | Executable controller waits for the pinned Orbax commit marker, signals only the exact recorded user-space training PIDs on all hosts, relaunches unchanged, and proves the new attempt's first metric continues at the saved step rather than step 0; TPU VM lifecycle is untouched | Not run |
 | 8. input throughput | Executable: per-host iterator waits plus accelerator step time, p95 wait-ratio ≤10%, zero local cache | Not run |
 
 `sunfish-readiness-ledger` is the final fail-closed merger. It pins hashes for
@@ -115,6 +118,14 @@ non-promotable subset. This resolves the ordering dependency: infrastructure
 must pass before Stage-1 can run full-128-expert calibration, but the readiness
 trainer needs an 8B-shaped model. The provisional subset is never scientific
 pruning evidence and is rejected by non-smoke phases.
+
+The 2026-07-13 allocation correction is also binding: TPU workers never reach
+PyPI or GitHub. A connected Linux packaging host builds and offline-validates
+one source/wheel archive; the controller deploys it to all workers through IAP
+SCP; worker pip is forced to `--no-index`. `scripts/tpu_iap.sh` is the sole TPU
+VM transport surface and exposes no create/start/stop/reset/delete operation.
+Gate 7 signals only exact user-space training PIDs after verifying their
+run/attempt environment and cannot mutate or power-cycle the allocation.
 
 ## Lane split
 
