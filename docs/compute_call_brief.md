@@ -10,18 +10,19 @@ on these answers.
 2. **Dates**: when does the window open and close, and is renewal
    realistic? We treat the window as a deadline and arrive with data and
    code staged.
-3. **Preemption policy**: on-demand or preemptible quota, and typical
-   reclaim behavior? (Our checkpointing assumes preemptible; on-demand is
-   a bonus.)
+3. **Allocation protection**: the pod is non-preemptible; confirm the
+   maintenance/reclaim policy and the exact allocation-owner escalation path.
+   Sunfish will not start, stop, reset, reboot, delete, or reconfigure it.
 4. **Project ID** the quota lands in, and whether we get owner/editor on it
    or work inside someone else's project with a service account.
 5. **CPU VM path**: can we provision or receive credits for a separate
    high-memory CPU VM with at least 160 GB RAM? Stage-0 same-framework parity
    and exact-tree seed materialization load the 25B teacher off-TPU; TPU workers
    consume only the finished GCS seed and must not become conversion machines.
-6. **Egress or org-policy restrictions**: can the TPU VM reach Hugging Face
-   and PyPI for bootstrap? Any VPC-SC / org policy that blocks external
-   pulls?
+6. **IAP and Google API access**: confirm `gcloud alpha compute tpus tpu-vm
+   ssh/scp --worker=all --tunnel-through-iap`, required IAP/OS Login roles,
+   and service-account access to the exact GCS prefixes. Public worker egress
+   is not required or expected; dependencies arrive in the offline bundle.
 
 ## The one live test to run DURING the call (2 minutes)
 
@@ -53,7 +54,9 @@ settles it.
 Checkpoint downloaded and audited to the parameter; static conversion P1 is
 691/691, while the high-memory P2-P5 model-forward parity run remains explicit
 pre-TPU work. The multi-host trainer, immutable configs, exact-tree seed path,
-data loader, checkpoint/resume/preemption proofs, and eight-gate evidence
-ledger are implemented and locally tested. Hardware passes are not claimed
-until the granted slice emits the ledger. Storage lifecycle and cost
+data loader, checkpoint/resume/process-interruption proofs, and eight-gate evidence
+ledger are implemented and locally tested. Worker deployment is air-gapped:
+one offline-validated Linux wheel/source archive is transferred to every host
+through IAP, and Sunfish exposes no allocation lifecycle operation. Hardware
+passes are not claimed until the granted slice emits the ledger. Storage lifecycle and cost
 guardrails are written, so the window can start with the ordered gauntlet.

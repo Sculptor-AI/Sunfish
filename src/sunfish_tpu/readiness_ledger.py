@@ -410,7 +410,12 @@ def verify_readiness_ledger(
             is not None,
         )
     )
-    gate(7, preemption_ok, "preemption", "real kill and automatic same-workdir recovery")
+    gate(
+        7,
+        preemption_ok,
+        "recovery",
+        "exact user-process interruption and automatic same-workdir recovery; TPU VM untouched",
+    )
 
     smoke_gate8 = smoke.get("gates", {}).get("8", {})
     p95_wait_ratio = smoke_gate8.get("p95_input_wait_ratio")

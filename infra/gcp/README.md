@@ -120,49 +120,27 @@ gcloud storage buckets add-iam-policy-binding "$BUCKET" \
   --role roles/storage.objectAdmin
 ```
 
-Attach it at TPU VM creation (the TPU runbook's create command passes it and
-the cloud-platform scope explicitly). The HF token travels as a VM
-environment variable at SSH time — never in Git, never in instance metadata
-(metadata is readable by anything on the VM).
+The allocation owner attaches this account and the required scopes before
+handoff. Sunfish never mutates the allocated TPU VM. No Hugging Face token or
+other public-network credential is copied to a worker; model and seed artifacts
+arrive through approved GCS prefixes.
 
-### 4. Scratch disk — create, attach, mount (stage 0 runs on worker 0 only)
+### 4. Scratch disk — not part of the TPU path
 
-Stage-0 download + conversion is a **single-worker job**: one RW disk on
-worker 0. (A single balanced PD cannot be shared read-write across a
-multi-host slice; workers that later need the converted checkpoint read it
-from GCS, not from each other's disks.)
+Stage-0 download, conversion, parity, seed materialization, tokenization, and
+offline wheel-bundle construction all run off-TPU. TPU workers restore the
+finished seed and read immutable data from GCS. Do not attach/detach scratch
+disks or otherwise reconfigure the scarce allocation from Sunfish automation.
 
-```bash
-gcloud compute disks create sunfish-scratch --size 200GB \
-  --type pd-balanced --zone "$ZONE" --project "$PROJECT_ID"
+### 5. Outbound network — workers are air-gapped
 
-gcloud alpha compute tpus tpu-vm attach-disk "$TPU_NAME" \
-  --zone "$ZONE" --disk sunfish-scratch --mode read-write
-
-# On worker 0:
-sudo mkfs.ext4 -m 0 /dev/sdb            # first time only — DESTROYS disk contents
-sudo mkdir -p /mnt/disks/sunfish-cache
-sudo mount -o discard,defaults /dev/sdb /mnt/disks/sunfish-cache
-sudo chown "$USER" /mnt/disks/sunfish-cache
-```
-
-~$20/month while it exists. Detach and delete between working periods;
-recreate + re-download costs about an hour.
-
-### 5. Outbound network — decide before bootstrap, not during
-
-"No external IPs" is the steady-state rule, but Private Google Access covers
-only Google APIs (GCS) — **not PyPI, GitHub, or Hugging Face**, which
-bootstrap and the checkpoint download need. Choose one:
-
-- **Default (simple):** let the TPU VM keep its ephemeral external IP during
-  bootstrap + download, then continue using it only for GCS traffic (free
-  intra-region). Cost: ~$0.005/hr per IP while attached — dollars, not tens.
-- **Strict (only if required):** Cloud NAT — but price it first (hourly +
-  per-GiB processing; a 52 GB download through NAT has a real cost) and
-  pre-test it before the window.
-
-Never *reserve* static external IPs; reserved-but-unattached IPs bill more.
+The TPU VMs have no public internet access. Do not add external IPs or Cloud
+NAT. A connected Linux packaging host resolves PyPI/GitHub once and emits the
+hash-bound offline source/wheel archive. The controller copies it to all
+workers with `gcloud alpha ... tpu-vm scp --worker=all
+--tunnel-through-iap`; worker bootstrap uses only `--no-index`. Worker access
+to GCS uses the attached service account and Google API path, not public
+package/model endpoints.
 
 ## Standing money rules
 
@@ -170,8 +148,9 @@ Never *reserve* static external IPs; reserved-but-unattached IPs bill more.
    Intra-region TPU↔GCS is free; pulling to the house costs ~$0.12/GiB.
    Quantized artifacts (4-8 GB, ~$1): freely. bf16 checkpoints (16 GB, ~$2):
    deliberately. Traces (3 TiB, **~$369**): NEVER — this is the single
-   biggest possible mistake. Download the upstream checkpoint directly on
-   TPU scratch, not house→GCS.
+   biggest possible mistake. Download/materialize on the approved off-TPU
+   compute host in-region and stage only required artifacts to GCS; never use
+   the TPU pod or Chase's laptop as the conversion machine.
 2. **The CPU sandbox VM (stages 6-7) runs only during rollout generation.**
    Spot provisioning (~60-90% off), stopped whenever rollouts aren't
    running. A forgotten on-demand e2-standard-16 is ~$390/month.
@@ -181,8 +160,8 @@ Never *reserve* static external IPs; reserved-but-unattached IPs bill more.
    the dominant reason is throughput, not the ops bill.
 4. **Costs this plan tracks but does not itemize** (kept small by design;
    check them in the SKU report if the budget alert fires): Cloud
-   Logging/Monitoring ingestion, VM boot disks, NAT if chosen, Nearline
-   retrieval/early-deletion fees, ephemeral external IPs.
+   Logging/Monitoring ingestion, VM boot disks, IAP traffic, and Nearline
+   retrieval/early-deletion fees.
 
 ## End-of-session checklist (every working day)
 

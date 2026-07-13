@@ -76,6 +76,14 @@ starts it, note it here.
 
 ## Decision log (newest first)
 
+- 2026-07-13: **TPU workers are air-gapped and IAP-only.** Worker bootstrap
+  may not reach PyPI, GitHub, Hugging Face, or any public package/model
+  endpoint. A connected Linux host builds the immutable offline release;
+  controller traffic uses `gcloud alpha compute tpus tpu-vm ssh/scp` with
+  `--worker=all --tunnel-through-iap` (and all-worker SSH batch). Sunfish must
+  never create/start/stop/reset/reboot/delete/reconfigure the non-preemptible
+  allocation.
+  Gate 7 may signal only exact recorded user-space training PIDs.
 - 2026-07-12: **Stage-1 reconstruction gate is now precommitted and
   executable.** On the stratified 100k-token sample, every phase/workload ×
   layer must have relative RMSE ≤0.15 and cosine ≥0.99, with ≥4,000 tokens per
@@ -246,3 +254,36 @@ being published together on a dedicated `codex/` branch. The branch is a
 reviewable implementation handoff; it does not claim any TPU readiness gate
 passed, and Stage-0 parity evidence must be regenerated from the committed
 source revision before deployment.
+
+**Air-gap/IAP correction (Codex, 2026-07-13):** Chase's external review found
+that the published worker bootstrap incorrectly resolved packages online and
+the worker-control scripts used the non-IAP command form. The prior 208-test
+deployment claim is superseded until this correction passes its full suite.
+Codex owns the repair in the existing infra lane: immutable Linux source/wheel
+bundle built off-TPU, URL-free resolved lock, `PIP_NO_INDEX=1` worker install,
+exported source identity, all-worker alpha IAP SSH/SCP, and static allocation-
+safety enforcement. The operational script `kill_tpu_attempt.sh` is renamed
+to `interrupt_training_attempt.sh` so its scope is unambiguous; it verifies
+the current-user PID, exact `sunfish-train` command line, and run/attempt
+environment in `/proc` before signaling only that user process. No
+Claude-owned router/data API is changed. Review requested on WIRE seq 52.
+
+**Air-gap/IAP correction complete (Codex, 2026-07-13):** the worker release
+path now has no online resolver or VCS step. A connected glibc Linux/x86_64
+Python 3.12 builder downloads binary third-party wheels, builds only the pinned
+Gemma/Sunfish wheels, installs every artifact with `--no-deps`, runs offline
+`pip check`, emits a URL-free fully resolved lock, reconstructs a second clean
+environment with `PIP_NO_INDEX=1`, audits installed private APIs, and packs a
+source/wheel/hash-bound archive. Workers receive that archive only through the
+all-worker IAP wrapper; source, archive, wheel metadata, exact distribution
+set, config, and release identities are verified before distributed JAX.
+Connected-only scripts also refuse the TPU-worker marker, and the transport
+rejects public URLs/package resolution plus TPU lifecycle or reconfiguration
+commands. Bootstrap retries use release-scoped building/completion markers and
+never move a virtualenv or delete an unmarked directory. Final local
+verification is **219 tests green with 21 intentional heavy-stack skips**, 21
+CLI help checks, five strict TOMLs, static air-gap/IAP/allocation policy,
+shells, bytecode, notebook JSON, executable bits, and `git diff --check` all
+green. The connected Linux archive build, real all-worker deployment, Stage-0
+P2-P5, seed materialization, and hardware readiness gates remain unrun; TPU
+readiness is still 0/8.

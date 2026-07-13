@@ -39,12 +39,14 @@ for filename in "${files[@]}"; do
 done
 
 controller_python="${SUNFISH_CONTROLLER_PYTHON:-python3}"
+remote_python="${SUNFISH_REMOTE_PYTHON_BIN:-python3.12}"
 PYTHONPATH=src "${controller_python}" -c \
   'import pathlib,sys; from sunfish_tpu.deployment_config import validate_rendered_config_file; validate_rendered_config_file(pathlib.Path(sys.argv[1]), source_root=pathlib.Path(sys.argv[2]), require_bundle=True)' \
   "${local_dir}/sunfish-smoke.toml" "$(pwd)"
 
 quote_arg() { printf '%q' "$1"; }
-gcloud_bin="${SUNFISH_GCLOUD_BIN:-gcloud}"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+iap="${script_dir}/tpu_iap.sh"
 bundle_digest="$(python3 -c \
   'import hashlib,pathlib,sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' \
   "${local_dir}/rendered-configs.json")"
@@ -59,28 +61,20 @@ prepare="test ! -e $(quote_arg "${remote_dir}")"
 prepare+=" && test ! -e $(quote_arg "${remote_temp}")"
 prepare+=" && mkdir -p $(quote_arg "${remote_parent}")"
 prepare+=" && mkdir $(quote_arg "${remote_temp}")"
-"${gcloud_bin}" compute tpus tpu-vm ssh "${TPU_NAME}" \
-  --project "${PROJECT_ID}" --zone "${ZONE}" --worker=all \
-  --command "${prepare}"
+"${iap}" ssh-all --command "${prepare}"
 
 for filename in "${files[@]}"; do
   local_path="${local_dir}/${filename}"
   remote_path="${remote_temp}/${filename}"
-  "${gcloud_bin}" compute tpus tpu-vm scp "${local_path}" \
-    "${TPU_NAME}:${remote_path}" \
-    --project "${PROJECT_ID}" --zone "${ZONE}" --worker=all
+  "${iap}" scp-all "${local_path}" "${remote_path}"
   digest="$(python3 -c \
     'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' \
     "${local_path}")"
-  verify="python3 -c $(quote_arg 'import hashlib,pathlib,sys; actual=hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest(); raise SystemExit(0 if actual == sys.argv[2] else 1)')"
+  verify="$(quote_arg "${remote_python}") -c $(quote_arg 'import hashlib,pathlib,sys; actual=hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest(); raise SystemExit(0 if actual == sys.argv[2] else 1)')"
   verify+=" $(quote_arg "${remote_path}") $(quote_arg "${digest}")"
-  "${gcloud_bin}" compute tpus tpu-vm ssh "${TPU_NAME}" \
-    --project "${PROJECT_ID}" --zone "${ZONE}" --worker=all \
-    --command "${verify}"
+  "${iap}" ssh-all --command "${verify}"
 done
 
 finalize="test ! -e $(quote_arg "${remote_dir}")"
 finalize+=" && mv $(quote_arg "${remote_temp}") $(quote_arg "${remote_dir}")"
-"${gcloud_bin}" compute tpus tpu-vm ssh "${TPU_NAME}" \
-  --project "${PROJECT_ID}" --zone "${ZONE}" --worker=all \
-  --command "${finalize}"
+"${iap}" ssh-all --command "${finalize}"

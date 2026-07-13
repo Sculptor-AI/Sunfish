@@ -60,8 +60,14 @@ per-host full replication, (4) tiny-dataset training smoke, (5) distributed
 checkpoint save/restore, (6) exact resume vs uninterrupted control, (7)
 preemption recovery without manual cleanup, (8) input throughput not
 GCS-starved. Prerequisites: distributed-init-first entrypoints, an all-host
-launcher, a Kauldron-safe launch path, a process-sharded input pipeline,
-an explicit mesh/partition policy, and fully pinned dependencies.
+IAP launcher, a Kauldron-safe launch path, a process-sharded input pipeline,
+an explicit mesh/partition policy, and fully pinned dependencies. TPU workers
+have no public egress: a connected Linux packaging host must prebuild and
+offline-validate the complete source/wheel archive, every worker install is
+`--no-index`, and all SSH/SCP uses the alpha TPU VM API with `--worker=all`
+and `--tunnel-through-iap`. Sunfish never creates, starts, stops, resets,
+reboots, deletes, or otherwise reconfigures the scarce allocation; gate 7
+interrupts only exact recorded user-space training processes.
 Every real launch is additionally bound to the controller Git commit,
 deployable-source digest, raw and canonical config digests, exact Gemma source
 commit, and a static audit of the installed private Gemma/Kauldron/Orbax APIs.
@@ -244,8 +250,11 @@ CPU VM + Docker for
 rollout sandboxes; RunPod fallback ($350-1,500 worst case) if TRC lapses;
 RTX 5080 + M-series for deployment truth. Details: `docs/training.md`.
 Standing rules: run `infra/tpu/README.md` preflight on the actual topology;
+deploy the immutable offline worker bundle through all-worker IAP SCP and use
+only the guarded IAP launcher; never mutate the TPU allocation lifecycle;
 Orbax→GCS checkpoints every 30-60 min, tested exact-resume, off-device metrics
-(W&B), tokenize-once data staging in GCS.
+in GCS with optional controller-side W&B mirroring, tokenize-once data staging
+in GCS.
 
 ## Top risks (full list: `docs/architecture.md`)
 

@@ -57,14 +57,34 @@ class TpuDependencyLockTests(unittest.TestCase):
         }
         self.assertEqual(lock_pins, project_pins)
 
-    def test_bootstrap_separates_unreleased_gemma_from_resolver(self):
+    def test_worker_bootstrap_uses_only_the_verified_offline_bundle(self):
         root = Path(__file__).resolve().parents[1]
         base = (root / "requirements-tpu-base.lock").read_text(encoding="utf-8")
         source = (root / "requirements-gemma-source.lock").read_text(encoding="utf-8")
         bootstrap = (root / "scripts/bootstrap_tpu.sh").read_text(encoding="utf-8")
+        builder = (root / "scripts/build_tpu_offline_bundle.sh").read_text(
+            encoding="utf-8"
+        )
         self.assertNotIn("gemma @", base)
         self.assertRegex(source, r"gemma @ .*@[0-9a-f]{40}")
-        self.assertIn("--no-deps --requirement requirements-gemma-source.lock", bootstrap)
+        self.assertNotIn("requirements-gemma-source.lock", bootstrap)
+        self.assertNotIn("pip install --upgrade", bootstrap)
+        self.assertIn("PIP_NO_INDEX=1", bootstrap)
+        self.assertIn("--no-index", bootstrap)
+        self.assertIn("--no-deps", bootstrap)
+        self.assertIn("--only-binary=:all:", bootstrap)
+        self.assertIn("offline-requirements.lock", bootstrap)
+        self.assertIn(".sunfish-offline-building", bootstrap)
+        self.assertIn(".sunfish-offline-complete", bootstrap)
+        self.assertIn("refusing to remove an unmarked existing environment", bootstrap)
+        self.assertNotIn("staging_venv", bootstrap)
+        self.assertIn("-m pip check", bootstrap)
+        self.assertIn("requirements-gemma-source.lock", builder)
+        self.assertIn("--connected-build-host", builder)
+        self.assertIn("-m pip download", builder)
+        self.assertIn("--only-binary=:all:", builder)
+        self.assertIn('"${wheel_files[@]}"', builder)
+        self.assertIn("-m pip check", builder)
         self.assertIn("sunfish-runtime-api-audit", bootstrap)
         self.assertLess(
             bootstrap.index("sunfish-runtime-api-audit"),
@@ -112,6 +132,7 @@ class TpuDependencyLockTests(unittest.TestCase):
         bootstrap = (root / "scripts/bootstrap_tpu_controller.sh").read_text()
         self.assertIn("--no-deps --editable .", bootstrap)
         self.assertIn("parity_evidence", bootstrap)
+        self.assertIn("offline_bundle", bootstrap)
         self.assertIn("validate_readiness_unlock", bootstrap)
         for forbidden in ("jax", "libtpu", "flax", "kauldron", "orbax"):
             self.assertNotIn(forbidden + "==", "\n".join(lines))

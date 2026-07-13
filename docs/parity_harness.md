@@ -21,8 +21,9 @@ the gate and must be explained.
   (deterministic kernels); one additional bf16 run to confirm dtype parity.
 - `requirements-parity.lock` and the runtime guard pin every load-bearing
   direct dependency. `scripts/bootstrap_parity.sh` records the full transitive
-  `pip freeze`. This environment belongs on a high-memory compute host, never
-  Chase's laptop.
+  `pip freeze`. This environment belongs on an internet-connected high-memory
+  CPU compute host, never Chase's laptop and never the network-isolated TPU
+  pod. Only its immutable report/traces move into the TPU deployment bundle.
 - The report and each trace record the Sunfish Git commit and deterministic
   source-tree SHA-256. Resume metadata includes that identity, so a code or
   configuration edit invalidates an otherwise reusable trace.
@@ -124,12 +125,13 @@ converter manifest. The stage-0 gate in PLAN.md closes only on all-pass.
 
 ## Execution
 
-Run on a Linux x86_64 CPU host with enough RAM for one 25B float32 model plus
+Run off-TPU on a Linux x86_64 CPU host with enough RAM for one 25B float32 model plus
 loader/vision/cache overhead (budget at least 160 GB). The harness loads
 only one model at a time and writes resumable traces after each model/dtype:
 
 ```bash
-PYTHON_BIN=python3.12 VENV_DIR=.venv-parity scripts/bootstrap_parity.sh
+PYTHON_BIN=python3.12 VENV_DIR=.venv-parity \
+  scripts/bootstrap_parity.sh --connected-compute-host
 
 .venv-parity/bin/sunfish-parity run \
   --source /mnt/checkpoints/diffusiongemma-upstream \

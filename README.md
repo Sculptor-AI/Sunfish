@@ -72,6 +72,7 @@ supports a specific candidate.
 - `src/sunfish/checkpoint_audit.py` — header-only safetensors recount tool
 - `src/sunfish/checkpoint_convert.py` — dependency-free streaming text/pruning converter
 - `src/sunfish/source_tree.py` — deterministic deployable-source identity for artifacts and TPU launches
+- `src/sunfish_tpu/offline_bundle.py` — immutable no-egress source/wheel release contract
 - `src/sunfish_tpu/tpu_preflight.py` — JAX device, package, and GCS readiness checks
 - `src/sunfish_tpu/checkpoint_smoke.py` — exact Orbax save/restore probe for local/GCS paths
 - `src/sunfish_tpu/parity.py` — resumable Stage-0 P2-P5 exact PyTorch parity harness
@@ -80,7 +81,7 @@ supports a specific candidate.
 - `src/sunfish_tpu/topology_smoke.py` — structured all-host topology/collective proof
 - `src/sunfish_tpu/seed_load_smoke.py` — real 8B target-sharded Orbax restore proof
 - `src/sunfish_tpu/real_resume_smoke.py` — production exact-next-update resume proof
-- `src/sunfish_tpu/preemption_gate.py` — exact-attempt kill/recovery orchestrator
+- `src/sunfish_tpu/preemption_gate.py` — exact-process interruption/recovery orchestrator
 - `src/sunfish_tpu/smoke_evidence.py` — tiny-overfit and input-wait gate analyzer
 - `src/sunfish_tpu/readiness_ledger.py` — final eight-gate lineage/hash merger
 - `src/sunfish_tpu/deployment_config.py` — immutable Stage-0.5 config renderer
@@ -93,6 +94,10 @@ supports a specific candidate.
 - `configs/training/stage05-first32-selection.json` — readiness-only, non-promotable 32-expert subset
 - `src/sunfish_tpu/training/` — strict Kauldron harness and prefix-amortized objective
 - `infra/tpu/README.md` — TPU VM bootstrap, access checklist, and launch gates
+- `scripts/build_tpu_offline_bundle.sh` — connected Linux release packager (never run on TPU)
+- `scripts/deploy_tpu_offline_bundle.sh` — all-worker IAP archive deployer
+- `scripts/probe_tpu_worker_base.sh` — backend-free all-worker base-image/ABI probe
+- `scripts/tpu_iap.sh` — guarded alpha IAP SSH/SCP transport with no lifecycle surface
 - `scripts/upload_tpu_configs.sh` — all-worker config copy plus byte-hash verification
 - `infra/gcp/README.md` — GCP setup and cost guardrails (budget alerts, lifecycle, egress rules)
 - `src/sunfish/router_stats.py` — bucketized router-mass accumulation schema
@@ -121,9 +126,9 @@ PYTHONPATH=src python -m sunfish_tpu.training.train \
   --config configs/training/sunfish-smoke.toml --validate-only
 
 # Real TPU commands never run directly from this quickstart. Complete Stage-0
-# P1-P5, render the source-bound deployment bundle, then use the all-worker
-# bootstrap and ordered gauntlet in infra/tpu/README.md. The launcher rejects
-# templates, partial bundles, source drift, and missing parity evidence.
+# P1-P5, render the source-bound deployment bundle, then use the air-gapped
+# all-worker IAP bootstrap and ordered gauntlet in infra/tpu/README.md. TPU
+# workers never contact PyPI/GitHub, and Sunfish never mutates the allocation.
 ```
 
 ## Upstream references

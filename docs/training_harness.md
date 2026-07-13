@@ -161,8 +161,13 @@ research, evaluation, recovery, or release run. Once Stage 2 approves the real
 selection, rerun this materializer with that same manifest used by the
 safetensors converter.
 
+This is off-TPU preparation. The CPU host may use its own connected bootstrap;
+none of these dependency-install commands may run on the network-isolated TPU
+pod. TPU workers receive only the finished exact-tree seed through GCS.
+
 ```bash
-PYTHON_BIN=python3.12 VENV_DIR=.venv-seed scripts/bootstrap_seed_cpu.sh
+PYTHON_BIN=python3.12 VENV_DIR=.venv-seed \
+  scripts/bootstrap_seed_cpu.sh --connected-compute-host
 
 # This is the exact public path hard-coded by Google's pinned DiffusionGemma
 # fine-tuning source. Inventory it before the high-memory job.
@@ -213,11 +218,12 @@ not inherit the source optimizer, data cursor, timer, or step counter.
 
 The released `gemma==4.0.1` does not contain `gemma.diffusion`. Google's
 official DiffusionGemma fine-tuning path currently lives in Gemma main, so the
-bootstrap installs exact commit
-`09e7b48ae88720f6236b8266c7213eb51bb62b87` (package version 4.1.0) with
-`--no-deps` after the exact base stack. This prevents that source tree's
-floating Hackable Diffusion dependency from moving. Runtime validation reads
-the installed distribution's `direct_url.json` and rejects any other commit.
+connected release builder fetches exact commit
+`09e7b48ae88720f6236b8266c7213eb51bb62b87` (package version 4.1.0), builds a
+wheel with no dependency resolution, and places it in the immutable offline
+bundle. This prevents that source tree's floating Hackable Diffusion
+dependency from moving. TPU runtime validation reads the hash-bound bundle
+manifest and rejects any other commit; it never reaches GitHub.
 `sunfish-runtime-api-audit` then parses the installed sources without importing
 JAX or those packages. It fails bootstrap if the private LoRA, ragged-MoE,
 mask/cache, Kauldron process-slicing/checkpoint-loop, or Orbax restore/commit
@@ -235,7 +241,13 @@ dataset/seed hashes and measured topology exist, use
 `infra/tpu/README.md`; the renderer also requires the all-pass Stage-0 P1-P5
 report from the identical deployable source tree. The uploader atomically
 publishes that report with the three configs and their manifest. Do not
-hand-edit the reviewed templates. Perform static validation against the
+hand-edit the reviewed templates. Before either upload or launch, build the
+Linux worker archive on a connected packaging host and deploy it to every
+worker with `scripts/deploy_tpu_offline_bundle.sh`. That script and all later
+transport use `gcloud alpha ... --worker=all --tunnel-through-iap` (SSH also
+uses `--batch-size=all`); workers install the complete resolved lock only from
+the local wheelhouse with
+`PIP_NO_INDEX=1 --no-index --no-deps`. Perform static validation against the
 rendered controller copy:
 
 ```bash
@@ -247,14 +259,19 @@ PYTHON_BIN=python3.12 VENV_DIR=.venv-tpu-controller \
   --validate-only
 ```
 
-Bootstrap each TPU VM only after the grant's measured counts are known:
+Bootstrap every TPU worker only after the grant's measured counts and offline
+release directory are known, and only through the guarded all-host launcher:
 
 ```bash
-EXPECTED_TPU_DEVICES=32 \
-EXPECTED_TPU_PROCESSES=8 \
-EXPECTED_LOCAL_TPU_DEVICES=4 \
-SUNFISH_GCS_WORKDIR=gs://BUCKET/sunfish/runs \
-scripts/bootstrap_tpu.sh
+scripts/launch_tpu_pod.sh \
+  --run-id "$BOOTSTRAP_RUN_ID" \
+  --config "$SMOKE_LOCAL_CONFIG" \
+  --remote-config "$SMOKE_REMOTE_CONFIG" \
+  -- \
+  env \
+  "SUNFISH_GCS_WORKDIR=$SUNFISH_GCS_WORKDIR" \
+  "SUNFISH_OFFLINE_BUNDLE_ROOT=$SUNFISH_OFFLINE_BUNDLE_ROOT" \
+  scripts/bootstrap_tpu.sh
 ```
 
 Launch the identical command on every worker:
@@ -270,7 +287,7 @@ scripts/launch_tpu_pod.sh \
 ```
 
 Re-running that exact command against the same workdir is the supported normal
-recovery path. The destructive gate-7 proof uses
+recovery path. The gate-7 process-interruption proof uses
 `sunfish-preemption-smoke.toml` and `sunfish-preemption-gate` with its own
 fresh workdir, so it cannot mistake a previously completed gate-4 run for a
 successful recovery. Gate 6 similarly uses `sunfish-resume-smoke.toml` and an
@@ -286,7 +303,7 @@ empty workdir. Changing any other TOML field requires a new run ID/workdir.
 | 4. 100-500 update smoke | `phase = "smoke"` + `sunfish-smoke-evidence` | ≥100 contiguous steps, finite/nonzero norms, ≥10% tiny-set loss reduction |
 | 5. save/restore | `sunfish-checkpoint-smoke` distributed composite state | every host observes exact GCS round trip |
 | 6. exact resume | `sunfish-real-resume-smoke` on the production model/optimizer/Grain/Orbax path | next batch/loss/trainable grad+update+params/full optimizer+collections+step exact; base frozen |
-| 7. preemption | `sunfish-preemption-gate` on a fresh identical-lineage workdir | finalized checkpoint survives exact-attempt kill; unchanged relaunch starts its metric stream at the saved step rather than step 0 and completes without cleanup |
+| 7. recovery | `sunfish-preemption-gate` on a fresh identical-lineage workdir | finalized checkpoint survives an exact user-process interruption; unchanged relaunch starts its metric stream at the saved step rather than step 0 and completes without cleanup; the TPU VM is untouched |
 | 8. throughput | real trainer iterator waits divided by accelerator step time | p95 ≤10%, zero local cache |
 
 No row in this table is a hardware pass until its evidence is recorded from

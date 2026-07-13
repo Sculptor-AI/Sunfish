@@ -1,43 +1,58 @@
-# Cloud TPU pod-slice launch procedure (distilled)
+# Cloud TPU pod-slice launch procedure (Sunfish-corrected)
 
-Source: https://docs.cloud.google.com/tpu/docs/jax-pods (fetched 2026-07-11)
+The original public example fetched JAX on each worker and used the classic
+non-IAP command form. That example is **not operational for this allocation**:
+the TPU VMs have no public internet access and are reachable only through IAP.
 
-## Install on every worker
+## Sunfish transport contract
 
-```bash
-gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
-  --zone="$ZONE" --project="$PROJECT_ID" \
-  --worker=all \
-  --command='pip install -U "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html'
-```
-
-`--worker=all` executes on every host of the slice. For Sunfish, replace the
-pip line with our pinned bootstrap (`bash scripts/bootstrap_tpu.sh`).
-
-## Ship code + run on every worker
+Every remote command uses:
 
 ```bash
-gcloud compute tpus tpu-vm scp ./program.py "$TPU_NAME": \
-  --worker=all --zone="$ZONE" --project="$PROJECT_ID"
-
-gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
-  --zone="$ZONE" --project="$PROJECT_ID" \
+gcloud alpha compute tpus tpu-vm ssh "$TPU_NAME" \
+  --project "$PROJECT_ID" \
+  --zone "$ZONE" \
   --worker=all \
-  --command="python3 ./program.py"
+  --batch-size=all \
+  --tunnel-through-iap \
+  --command="..."
 ```
 
-(Sunfish will `git clone` + run the module instead of scp-ing single files;
-the launch pattern is identical. Same run ID/config/paths on every worker.)
+Every controller-to-worker file transfer uses:
+
+```bash
+gcloud alpha compute tpus tpu-vm scp LOCAL_FILE \
+  "$TPU_NAME":/absolute/remote/path \
+  --project "$PROJECT_ID" \
+  --zone "$ZONE" \
+  --worker=all \
+  --tunnel-through-iap
+```
+
+Operational scripts do not spell those commands independently. They call
+`scripts/tpu_iap.sh`, whose only transport operations are `ssh-all` and
+`scp-all`, requires the flags above and blocks TPU VM lifecycle/power
+commands. Its local-only `check-cli` operation verifies that this alpha
+command surface is installed without contacting a worker.
+
+## Air-gapped dependency and source delivery
+
+No worker runs `pip` against an index and no worker clones a repository. An
+internet-connected Linux packaging host builds the immutable Sunfish release
+archive. The controller transfers that one archive to every worker through
+IAP SCP. Workers verify its build-host SHA-256, source identity, URL-free
+resolved lock, and wheel inventory, then install with `PIP_NO_INDEX=1`,
+`--no-index`, `--no-deps`, `--only-binary=:all:`, and the local wheelhouse.
 
 ## Failure modes to design against
 
-- **Run on one worker only** → `jax.device_count()` (and any collective)
-  BLOCKS until the same code runs on every host. Symptom of a partial
-  launch is a silent hang, not an error message.
-- Duplicate output: gate prints/logging on `jax.process_index() == 0`;
-  per-worker log files should carry the worker index in the name.
+- Launching on one worker can leave distributed JAX silently blocked. All pod
+  programs therefore use the same `--worker=all` command and run identity.
+- A partial/corrupt transfer is rejected independently on every host before
+  package installation or JAX initialization.
+- Sunfish never changes the allocation lifecycle. Gate 7 interrupts only
+  exact recorded user-space training PIDs; it does not stop or reboot a VM.
 
-## Version caveat
-
-The guide targets the classic Cloud TPU API and explicitly does not support
-TPU7x+. Fine for v4/v5e; revisit if the grant lands on newer hardware.
+The public guide was fetched on 2026-07-11 for general JAX pod semantics. This
+file records the allocation-specific corrections supplied by Chase on
+2026-07-13; `infra/tpu/README.md` is the executable source of truth.

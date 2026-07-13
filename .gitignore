@@ -16,6 +16,8 @@ wandb/
 tpu-environment*.txt
 tpu-launch-logs/
 sunfish-logs/
+sunfish-tpu-offline-*.tar
+sunfish-tpu-offline-*.tar.sha256
 infra/tpu/job.env
 
 # agentwire mutable state (config + glossary ARE committed)

@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# This environment loads a 25B checkpoint in float32 and is for a high-memory
-# CPU/compute host only. Do not run it on Chase's laptop.
+# CONNECTED high-memory CPU host only, never a TPU worker. This environment
+# loads a 25B checkpoint in float32. Do not run it on Chase's laptop.
+
+[[ -z "${SUNFISH_TPU_WORKER:-}" ]] || {
+  echo "Stage-0 parity setup is forbidden on a TPU worker" >&2
+  exit 2
+}
+[[ "${1:-}" == "--connected-compute-host" && $# == 1 ]] || {
+  echo "usage: bootstrap_parity.sh --connected-compute-host" >&2
+  exit 2
+}
 PYTHON_BIN="${PYTHON_BIN:-python3.12}"
 VENV_DIR="${VENV_DIR:-.venv-parity}"
 ENVIRONMENT_RECORD="${ENVIRONMENT_RECORD:-parity-environment.txt}"
