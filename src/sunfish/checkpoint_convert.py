@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import BinaryIO
 
 from sunfish.checkpoint_audit import DTYPE_BITS
+from sunfish.source_tree import workspace_source_identity
 
 _HEADER_LENGTH_BYTES = 8
 _MAX_HEADER_BYTES = 100_000_000
@@ -187,17 +188,24 @@ def _load_json_object(path: Path) -> dict[str, object]:
     return value
 
 
-def _selection_from_file(
+def load_selection_manifest(
     path: Path,
     *,
     source_experts: int,
     retained_experts: int,
+    top_k_experts: int | None = None,
 ) -> dict[int, tuple[int, ...]]:
     payload = _load_json_object(path)
     if "source_experts" in payload and int(payload["source_experts"]) != source_experts:
         raise ValueError("selection source_experts does not match the checkpoint")
     if "retained_experts" in payload and int(payload["retained_experts"]) != retained_experts:
         raise ValueError("selection retained_experts does not match the conversion")
+    if (
+        top_k_experts is not None
+        and "top_k_experts" in payload
+        and int(payload["top_k_experts"]) != top_k_experts
+    ):
+        raise ValueError("selection top_k_experts does not match the conversion")
     raw_layers = payload.get("layers")
     if not isinstance(raw_layers, dict):
         raise ValueError("selection must contain a layers object")
@@ -221,6 +229,11 @@ def _selection_from_file(
             raise ValueError(f"layer {layer} selects an out-of-range expert")
         selection[layer] = experts
     return selection
+
+
+# Kept as a private alias for callers/tests written before the JAX seed
+# materializer shared this exact manifest contract.
+_selection_from_file = load_selection_manifest
 
 
 def _source_shards(source: Path, source_index: Mapping[str, object]) -> list[Path]:
@@ -266,10 +279,11 @@ def build_plan(
         raise ValueError("a per-layer selection manifest is required when pruning experts")
 
     selection = (
-        _selection_from_file(
+        load_selection_manifest(
             selection_path,
             source_experts=source_experts,
             retained_experts=retained_experts,
+            top_k_experts=top_k,
         )
         if selection_path is not None
         else {}
@@ -461,6 +475,7 @@ def convert(plan: ConversionPlan, output: Path, *, chunk_mib: int = 16) -> dict[
         raise FileExistsError(f"refusing to overwrite existing output directory {output}")
     if chunk_mib <= 0:
         raise ValueError("chunk_mib must be positive")
+    source_identity = workspace_source_identity(Path(__file__).resolve().parents[2])
     output.mkdir(parents=True)
     _copy_auxiliary_files(plan.shards[0].source_path.parent, output)
 
@@ -484,6 +499,7 @@ def convert(plan: ConversionPlan, output: Path, *, chunk_mib: int = 16) -> dict[
         **plan_report(plan),
         "selection": {str(layer): list(experts) for layer, experts in plan.selection.items()},
         "dropped_tensor_names": list(plan.dropped_tensors),
+        "sunfish_source": source_identity,
     }
     (output / _MANIFEST_NAME).write_text(json.dumps(manifest, indent=2) + "\n")
     return manifest

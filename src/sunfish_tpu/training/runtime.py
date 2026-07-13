@@ -5,6 +5,8 @@ from __future__ import annotations
 import importlib.metadata
 import importlib.util
 import json
+import os
+import re
 from typing import Any
 
 from etils import epath
@@ -17,8 +19,15 @@ from sunfish_tpu.training.dependencies import (
     TPU_ONLY_RUNTIME_VERSIONS,
 )
 from sunfish_tpu.training.spec import CheckpointFormat, HarnessConfig
+from sunfish_tpu.seed_manifest import validate_seed_manifest_bytes
+from sunfish_tpu.gcs_inventory import verify_live_gcs_inventory
+from sunfish_tpu.source_identity import (
+    require_launcher_run_id,
+    source_identity_from_environment,
+)
 
 RUN_MANIFEST_NAME = "sunfish-run.json"
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def verify_runtime_contract(*, require_tpu: bool) -> dict[str, str]:
@@ -70,6 +79,7 @@ def ensure_run_identity(
     replaced dataset and prevents checkpoints from being reused under a
     changed objective, topology, model, or dependency stack.
     """
+    require_launcher_run_id(config.run.run_id, required=require_tpu_runtime)
     actual_manifest = manifest_sha256(config.data.directory)
     if actual_manifest != config.data.manifest_sha256:
         raise ValueError(
@@ -90,20 +100,53 @@ def ensure_run_identity(
             raise FileNotFoundError(
                 f"pinned Kauldron checkpoint does not exist: {promoted_step}"
             )
+        seed_manifest_sha256 = ""
+    else:
+        seed_manifest_path = epath.Path(config.checkpoint.init_manifest_path)
+        if not seed_manifest_path.exists():
+            raise FileNotFoundError(
+                f"initial seed manifest does not exist: {seed_manifest_path}"
+            )
+        seed_payload = validate_seed_manifest_bytes(
+            seed_manifest_path.read_bytes(),
+            expected_sha256=config.checkpoint.init_manifest_sha256,
+            init_path=config.checkpoint.init_path,
+            phase=config.run.phase.value,
+            expected_num_experts=config.model.num_experts,
+            expected_top_k_experts=config.model.top_k_experts,
+        )
+        if require_tpu_runtime:
+            verify_live_gcs_inventory(
+                config.checkpoint.init_path,
+                seed_payload["output_gcs_inventory"],
+            )
+        seed_manifest_sha256 = config.checkpoint.init_manifest_sha256
 
     versions = verify_runtime_contract(require_tpu=require_tpu_runtime)
+    source_identity = source_identity_from_environment(
+        required=require_tpu_runtime
+    )
+    config_file_sha256 = os.environ.get("SUNFISH_CONFIG_FILE_SHA256", "")
+    if require_tpu_runtime and not _SHA256.fullmatch(config_file_sha256):
+        raise RuntimeError(
+            "SUNFISH_CONFIG_FILE_SHA256 must be set by the all-host launcher"
+        )
     payload = {
         "schema_version": 1,
         "run_id": config.run.run_id,
         "config_sha256": config.digest,
+        "config_file_sha256": config_file_sha256 or "unrecorded",
         "dataset_manifest_sha256": actual_manifest,
         "init_checkpoint": str(init_path),
         "init_checkpoint_format": config.checkpoint.format.value,
         "init_checkpoint_step": config.checkpoint.init_step,
+        "init_checkpoint_manifest": config.checkpoint.init_manifest_path,
+        "init_checkpoint_manifest_sha256": seed_manifest_sha256,
         "phase": config.run.phase.value,
         "model": config.canonical_dict()["model"],
         "runtime_versions": versions,
         "gemma_source_commit": GEMMA_SOURCE_COMMIT,
+        "sunfish_source": source_identity,
         "topology": {
             "device_count": int(jax.device_count()),
             "process_count": int(jax.process_count()),

@@ -125,6 +125,8 @@ class CheckpointSpec:
     format: CheckpointFormat = CheckpointFormat.EXACT_TREE
     model_param_path: str = "gemma_network.gemma_model"
     init_step: int = -1
+    init_manifest_path: str = ""
+    init_manifest_sha256: str = ""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -281,10 +283,25 @@ class HarnessConfig:
                 raise ValueError(
                     "checkpoint.init_step must be -1 for an exact-tree seed"
                 )
+            if not self.checkpoint.init_manifest_path:
+                raise ValueError(
+                    "checkpoint.init_manifest_path is required for an exact-tree seed"
+                )
+            if not _SHA256.fullmatch(self.checkpoint.init_manifest_sha256):
+                raise ValueError(
+                    "checkpoint.init_manifest_sha256 must be a lowercase SHA-256 digest"
+                )
         elif self.checkpoint.format is CheckpointFormat.KAULDRON_PARAMS:
             if self.checkpoint.init_step < 0:
                 raise ValueError(
                     "checkpoint.init_step must pin an explicit Kauldron step"
+                )
+            if (
+                self.checkpoint.init_manifest_path
+                or self.checkpoint.init_manifest_sha256
+            ):
+                raise ValueError(
+                    "Kauldron promotion uses its run identity, not an exact-tree seed manifest"
                 )
         if not self.checkpoint.init_path:
             raise ValueError("checkpoint.init_path must not be empty")

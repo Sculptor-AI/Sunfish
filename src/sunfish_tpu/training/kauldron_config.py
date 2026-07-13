@@ -28,6 +28,7 @@ with konfig.imports():
     from sunfish_tpu.training import losses as sunfish_losses
     from sunfish_tpu.training import model as sunfish_model
     from sunfish_tpu.training import prefix_amortized
+    from sunfish_tpu.training import readiness_writer as sunfish_readiness
     from sunfish_tpu.training import sharding as sunfish_sharding
 
 
@@ -127,6 +128,18 @@ def get_config():
             weight=spec.objective.encoder_loss_weight,
         ),
     }
+    cfg.train_metrics = {
+        "gradient_norm": kd.metrics.TreeReduce(
+            metric=kd.metrics.Norm(
+                tensor="grads", axis=None, aggregation_type="concat"
+            )
+        ),
+        "update_norm": kd.metrics.TreeReduce(
+            metric=kd.metrics.Norm(
+                tensor="updates", axis=None, aggregation_type="concat"
+            )
+        ),
+    }
 
     cfg.num_train_steps = spec.training.steps
     cfg.log_metrics_every = spec.training.log_metrics_every_steps
@@ -174,6 +187,11 @@ def get_config():
     else:
         cfg.optimizer = base_optimizer
 
+    readiness_enabled = (
+        spec.run.phase is Phase.SMOKE
+        and spec.topology.require_tpu
+        and not allow_non_tpu
+    )
     cfg.train_ds = sunfish_data.SunfishData(
         directory=spec.data.directory,
         expected_manifest_sha256=spec.data.manifest_sha256,
@@ -192,6 +210,7 @@ def get_config():
         num_workers=spec.data.num_workers,
         per_worker_buffer_size=2,
         shard_by_process=True,
+        enable_profiling=readiness_enabled,
     )
     if spec.checkpoint.format is CheckpointFormat.EXACT_TREE:
         cfg.init_transform = sunfish_checkpoint.ShardedOrbaxInitLoader(
@@ -210,6 +229,27 @@ def get_config():
         save_interval_steps=spec.training.checkpoint_every_steps,
         max_to_keep=spec.training.max_checkpoints_to_keep,
     )
+    source_identity = identity["sunfish_source"]
+    cfg.writer = sunfish_readiness.ReadinessMetricWriter(
+        readiness_enabled=readiness_enabled,
+        run_id=spec.run.run_id,
+        config_sha256=spec.digest,
+        dataset_manifest_sha256=spec.data.manifest_sha256,
+        seed_manifest_sha256=spec.checkpoint.init_manifest_sha256,
+        source_git_commit=source_identity["git_commit"],
+        source_tree_sha256=source_identity["source_tree_sha256"],
+    )
+    if readiness_enabled:
+        # ProfileAllHosts is driven by the lead-host hook and coordinates the
+        # whole pod. Iterator timing is the quantitative gate; XProf explains
+        # a failed ratio without changing the production loop.
+        cfg.profiler = kd.inspect.Profiler(
+            first_profile=10,
+            profile_duration_ms=10_000,
+            all_host=True,
+            every_steps=None,
+            every_secs=None,
+        )
     cfg.rng_streams = kd.train.RngStreams([
         kd.train.RngStream("default", train=True, eval=True),
         kd.train.RngStream("sampling", train=True, eval=True),

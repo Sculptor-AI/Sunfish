@@ -70,6 +70,52 @@ precise punch list and catches three traps we had not seen.
 
 No v4-64 job runs before all eight pass, in order.
 
+## Implementation status (2026-07-12)
+
+“Executable” below means locally implemented and unit-tested. It does not mean
+the hardware gate passed; only evidence from every worker on the granted slice
+and the real GCS prefix can do that.
+
+| Gate | Software status | Hardware evidence |
+| --- | --- | --- |
+| 1. topology/collective | Executable: `sunfish-topology-smoke`, init-first topology ownership, real global `psum`, all-host immutable summary | Not run |
+| 2. disjoint GCS input | Executable: bounded production Grain path, immutable per-host record IDs/read metrics, exact union proof | Not run |
+| 3. sharded seed load | Executable: `sunfish-seed-load-smoke` restores the real 8.11B seed directly into Phase-B target shardings and records per-host/device resident bytes | Not run |
+| 4. real training smoke | Executable: strict 100–500 update Kauldron trainer plus immutable per-step loss/gradient/update evidence and 10% tiny-set overfit criterion | Not run |
+| 5. distributed checkpoint | Executable: collective Phase-B synthetic Orbax proof plus production Kauldron checkpointer | Not run |
+| 6. exact resume | Executable: `sunfish-real-resume-smoke` compares production next batch/loss/trainable gradients+updates+params/full optimizer+collections/step and frozen-base invariance | Not run |
+| 7. preemption | Executable controller waits for pinned Orbax commit marker, kills an exact all-host attempt, relaunches unchanged, and proves the new attempt's first metric continues at the saved step rather than step 0 | Not run |
+| 8. input throughput | Executable: per-host iterator waits plus accelerator step time, p95 wait-ratio ≤10%, zero local cache | Not run |
+
+`sunfish-readiness-ledger` is the final fail-closed merger. It pins hashes for
+all eight summaries, rejects synthetic evidence for gates 3/6, and verifies
+model/data/seed/topology lineage across the normal smoke, real-resume, and
+fresh-workdir preemption runs. No hardware pass is claimed here.
+
+The controller path now renders three immutable, isolated configs, uploads and
+byte-verifies them on every worker, and binds every launch to Git, deployable
+source, raw config, and canonical config identities. Bootstrap statically
+audits the exact installed Gemma/Kauldron/Orbax source APIs before JAX backend
+initialization. Official teacher and generated seed prefixes are pinned by
+complete GCS generation/size/CRC32C inventories, and real seed restores re-list
+the output prefix before compilation. Gate 7 additionally proves continuation
+from a finalized checkpoint by the first resumed metric step and absence of a
+fresh step-0 metric.
+
+Stage-0 conversion parity is now a hard prerequisite rather than a runbook
+note: the renderer, uploader, launcher, and final ledger bind the complete
+source-matched P1-P5 report. The uploader publishes five files atomically to a
+new remote directory. The ledger re-runs the embedded host mergers for gates
+1/2/3/5/6 and enforces the quantitative gate-4/8 contracts instead of trusting
+their top-level booleans.
+
+The Stage-0.5 model seed deliberately uses
+`configs/training/stage05-first32-selection.json`, a deterministic and
+non-promotable subset. This resolves the ordering dependency: infrastructure
+must pass before Stage-1 can run full-128-expert calibration, but the readiness
+trainer needs an 8B-shaped model. The provisional subset is never scientific
+pruning evidence and is rejected by non-smoke phases.
+
 ## Lane split
 
 - **Codex (infra lane)**: P0 items 1-3 (preflight rewrite, Kauldron-safe

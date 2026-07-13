@@ -38,13 +38,16 @@ agent work. SculptorAI's first full training program.
 Stages run in order; each has a gate. **Never debug two interventions at
 once** — this rule already appears per-stage below and it is the plan's spine.
 
-### Stage 0 — Conversion and audit (local CPU, $0)
+### Stage 0 — Conversion and audit (off-TPU CPU, $0)
 
 Download upstream checkpoint → `checkpoint_audit.py --list` for real tensor
 names → dependency-free streaming converter (raw safetensors byte ranges) →
-**no-prune 128/8 text-only control**. The converter is implemented and tested
-on synthetic sharded checkpoints; validation against the gated upstream shard
-set and the model-level parity gate remain.
+**no-prune 128/8 text-only control**. Static P1 validation has passed against
+the full downloaded snapshot (691/691 retained tensors); the executable
+P2-P5 harness is implemented in `sunfish_tpu.parity` but its high-memory model
+forwards have not run yet. The model-level gate therefore remains open.
+Header audits and unit tests are laptop-safe; the P2-P5 25B model forwards run
+on a high-memory CPU host, never Chase's laptop.
 **Gate:** control reproduces upstream logits and generations exactly.
 
 ### Stage 0.5 — TPU readiness gauntlet (blocks ALL TPU stages)
@@ -59,18 +62,39 @@ preemption recovery without manual cleanup, (8) input throughput not
 GCS-starved. Prerequisites: distributed-init-first entrypoints, an all-host
 launcher, a Kauldron-safe launch path, a process-sharded input pipeline,
 an explicit mesh/partition policy, and fully pinned dependencies.
+Every real launch is additionally bound to the controller Git commit,
+deployable-source digest, raw and canonical config digests, exact Gemma source
+commit, and a static audit of the installed private Gemma/Kauldron/Orbax APIs.
+Readiness configs are rendered once into an immutable bundle and byte-verified
+on every worker; rendering and every launch require the source-matched all-pass
+Stage-0 P1-P5 report, and the final ledger revalidates that report plus all
+three raw/canonical configs. The official teacher, pruned seed, and calibration
+teacher are pinned as complete GCS object inventories (relative name,
+generation, size, CRC32C); the tiny readiness dataset enables full shard
+SHA-256 verification.
+The gauntlet uses the committed deterministic first-32 selection only to make
+the 8B-shaped infrastructure path runnable before scientific expert selection.
+That seed is explicitly non-promotable and provides no pruning-quality
+evidence. Stage 1 runs the full 128-expert calibration; Stage 2 then replaces
+the readiness seed with the coverage/reconstruction-approved selection.
 **Gate:** all eight pass, in order, on the granted slice. No training job
-before this.
+before this. The final ledger re-runs every host-evidence merger it can rather
+than trusting top-level `passed` booleans.
 
 ### Stage 1 — Router calibration (TPU/notebooks, ~$0)
 
+The calibration entrypoint requires and revalidates the immutable all-pass
+Stage-0.5 ledger; reconstruction inherits and revalidates the same receipt.
 JAX forward hook → `RouterStatsAccumulator`, bucketed by phase
 (prefill / high / mid / low noise) × workload (`docs/data.md` calibration set,
 ~75M tokens). Also bucket by canvas position.
 **Gate:** 32 retained experts hold at least 0.9× their size-normalized uniform
-mass baseline in *every* bucket (absolute 0.225 for 32/128), and pass the
-layer-output reconstruction gate. Router mass alone cannot approve pruning;
-if either gate fails, evaluate 48 experts with its own normalized floor.
+mass baseline in *every* phase/workload/position bucket (absolute 0.225 for
+32/128), then pass layer-output reconstruction on the 100k-token sample in
+every phase/workload bucket and layer: relative RMSE ≤0.15 and cosine ≥0.99,
+with at least 4,000 tokens per bucket. Router mass alone cannot approve
+pruning. If either gate fails, evaluate 48 experts at mass floor 0.3375 and
+the same normalized reconstruction bounds.
 
 ### Stage 2 — Pruning ablation ladder (TPU, ~$0)
 

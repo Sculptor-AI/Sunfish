@@ -62,6 +62,9 @@ log_summaries_every_steps = 100
 init_path = "gs://YOUR_BUCKET/sunfish/checkpoints/sunfish-32e4-orbax"
 format = "orbax-exact-tree"
 model_param_path = "gemma_network.gemma_model"
+init_manifest_path = "gs://YOUR_BUCKET/sunfish/checkpoints/sunfish-32e4-orbax.json"
+# Replace with sha256(init_manifest_path); it must attest promotion_allowed=true.
+init_manifest_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 
 [topology]
 require_tpu = true

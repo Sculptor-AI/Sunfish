@@ -21,15 +21,15 @@ TRC (https://sites.research.google/trc/about/) grants free TPU quota —
 typically a mix of on-demand and preemptible v2-8/v3-8 devices, with newer
 generations (v4/v5e) sometimes available on request — in renewable ~30-60 day
 windows. The TPU time is free; the project pays only incidentals (GCS storage,
-checkpoint egress — a few dollars, not hundreds).
+checkpoint egress, and any fallback compute; the accepted run-profile storage
+envelope is detailed below).
 
-**Allocation status: pending confirmation.** The executable baseline targets a
-single-host, eight-device TPU slice such as a v3-8, because that is enough to
-validate conversion, router instrumentation, exact resume, and small recovery
-pilots. `infra/tpu/README.md` makes the expected global device count an input;
-do not hard-code v3, v4, host count, or topology until the grant is confirmed.
-A larger v4/v5 slice reduces trace-generation and training wall time but is an
-optimization, not a correctness dependency.
+**Allocation status: 32×v4 (64 cores) requested; exact granted topology still
+pending confirmation.** `infra/tpu/README.md` makes global device, process, and
+local-device counts measured inputs; do not infer their JAX values or host
+layout from the request. The eight-gate readiness gauntlet runs on the granted
+slice before calibration or training. Smaller Colab/Kaggle TPU sessions remain
+useful for isolated warm-up tests, not as evidence for the granted topology.
 
 Fit by phase:
 
@@ -57,9 +57,11 @@ Constraints to plan around:
 
 ## Fallback and supporting lanes
 
-- **Local machine / CPU** — checkpoint conversion and tensor audits. Conversion
-  copies bounded raw safetensors byte ranges; it never needs the full 50 GB
-  bf16 model resident.
+- **Chase's laptop** — edits, unit tests, header-only tensor audits, and small
+  verifications only. It is not a compute node.
+- **High-memory CPU VM / Colab** — checkpoint conversion, seed materialization,
+  bulk tokenization, and other multi-GB jobs. Conversion copies bounded raw
+  safetensors byte ranges, but its aggregate I/O still stays off the laptop.
 - **Kaggle / Colab free tiers** — router calibration forwards, zero-shot
   pruning evals, and smoke tests; also the JAX warm-up lane (Kaggle's TPU
   v3-8 sessions run the same stack as TRC) while a TRC application is pending.
@@ -68,7 +70,7 @@ Constraints to plan around:
 - **RunPod rented GPUs** — the paid fallback if TRC quota lapses mid-run or a
   phase needs CUDA specifically. Default instance is a single A100 80 GB
   (~$1.2-1.9/hr); an L40S 48 GB (~$0.8-1.1/hr) covers LoRA-only stages.
-- **RTX 5080 (local)** — inference benchmarking, quantized-model evals, and
+- **RTX 5080 workstation** — inference benchmarking, quantized-model evals, and
   the end-to-end agent-latency gate. Not a training device: 16 GB does not fit
   the bf16 student's weights (~16.2 GB).
 
@@ -76,14 +78,14 @@ Constraints to plan around:
 
 | Phase | Work | Hardware | Envelope (TRC / fallback) |
 | --- | --- | --- | --- |
-| 0 | Checkpoint conversion, no-prune control, tensor audit | Local CPU | $0 |
+| 0 | Checkpoint conversion, no-prune control, tensor audit | High-memory CPU VM / Colab | $0-40 |
 | 1 | Router calibration traces across phases/workloads | Free notebooks or allocated TPU | $0 / $0-40 |
-| 2 | Rolling-window teacher traces: router probs + selected hidden states | Allocated TPU, bf16 26B sharded, forward-only | ~$0 / $30-100 |
+| 2 | Full offline teacher traces: router probs + selected hidden states | Allocated TPU, bf16 26B sharded, forward-only | ~$0 / $30-100 |
 | 3 | Zero-shot ablation evals (128/8 → … → 32/4) | Free notebooks + TRC | ~$0 / $20-80 |
 | 4 | Router-only training, then router + hidden-state distillation | Allocated TPU | ~$0 / $50-150 |
 | 5 | LoRA recovery on attention, shared MLP, selected experts; diffusion objective + encoder AR loss | Allocated TPU, 1-3 B tokens | ~$0 / $150-600 |
 | 6 | Coding/agentic diffusion SFT | Allocated TPU | ~$0 / $100-500 |
-| 7 | Export + quantize: NVFP4/int4 for the 5080, MLX 4-bit for the M5 | Local | $0 |
+| 7 | Export + quantize: NVFP4/int4 for the 5080, MLX 4-bit for the M5 | Workstation / RunPod; M5 verifies final artifact | $0-50 |
 
 "~$0" TRC envelopes still carry incidentals: GCS storage (see the storage
 budget below; ~$100/month at peak, ~$25/month after trace cleanup) and egress
@@ -116,18 +118,18 @@ longer forced by budget.
 | Checkpoints | ~200 GB | Full, self-contained checkpoints first, rolling window of 2-3; stage-gate milestones to colder storage. Base+delta composition is a later optimization that must pass the same exact-resume gate before use. |
 | RL trajectories, eval outputs | ~50 GB | Keep verified-success trajectories (expert iteration needs them) zstd-compressed; prune failures after difficulty stats are extracted |
 
-**Distillation without a full trace store.** The safe default does not assume
-the 26B teacher and student fit together with useful batch size on an unknown
-TPU topology:
+**Fallbacks if the full trace store becomes infeasible.** The approved default
+is the replayable full offline store. Neither fallback assumes the 26B teacher
+and student fit together with useful batch size on an unknown TPU topology:
 
-- **Rolling window** (default): generate
+- **Rolling window** (storage fallback): generate
   traces for the next ~10M tokens (4 layers, fp8), consume, delete. Bounded
   at ~150 GB regardless of total distill tokens.
 - **Online distillation** (optional): teacher forward runs live during student
   training. Enable only if a measured co-residency pilot fits and improves
   end-to-end throughput after accounting for the extra teacher compute.
 
-**What the lean profile deliberately preserves** — do not cut these:
+**What either fallback deliberately preserves** — do not cut these:
 checkpoint *frequency* (30-60 min; preemption safety), the tested
 exact-resume path, off-device
 scalar metrics (W&B free tier — tiny and they are the forensic record that
@@ -135,7 +137,7 @@ deleted checkpoints can no longer provide), decontamination reports and eval
 outputs for the tech report (small), and one debug sample per deleted log
 class.
 
-**What it accepts:** reproducing a distillation run means regenerating
+**What the rolling-window fallback accepts:** reproducing a distillation run means regenerating
 teacher outputs (deterministic given seed + teacher checkpoint) rather than
 replaying stored traces; and a divergence noticed later than 2-3 checkpoints
 back means restarting the phase from its milestone rather than rewinding
@@ -144,9 +146,10 @@ precisely. Both are cheap at our phase lengths.
 Memory sanity: the bf16 student is ~16.2 GB. With experts and backbone frozen
 and only router/LoRA parameters carrying optimizer state, a v3-8 (128 GB HBM)
 or a single A100 80 GB holds weights, activations (with checkpointing), and
-optimizer with a comfortable margin. Distillation defaults to rolling-window
-offline traces on every provider; online co-residency is enabled only after a
-topology-specific fit and throughput measurement.
+optimizer with a comfortable margin. Distillation defaults to the full offline
+trace store on every provider. Rolling-window traces are a storage fallback;
+online co-residency is enabled only after a topology-specific fit and
+end-to-end throughput measurement.
 
 ## Throughput and cost model
 

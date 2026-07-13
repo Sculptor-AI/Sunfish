@@ -71,10 +71,29 @@ supports a specific candidate.
 - `src/sunfish/sampling.py` — dependency-free sampler correctness oracle
 - `src/sunfish/checkpoint_audit.py` — header-only safetensors recount tool
 - `src/sunfish/checkpoint_convert.py` — dependency-free streaming text/pruning converter
+- `src/sunfish/source_tree.py` — deterministic deployable-source identity for artifacts and TPU launches
 - `src/sunfish_tpu/tpu_preflight.py` — JAX device, package, and GCS readiness checks
 - `src/sunfish_tpu/checkpoint_smoke.py` — exact Orbax save/restore probe for local/GCS paths
+- `src/sunfish_tpu/parity.py` — resumable Stage-0 P2-P5 exact PyTorch parity harness
+- `src/sunfish_tpu/parity_evidence.py` — strict source-bound P1-P5 deployment gate
+- `src/sunfish_tpu/input_smoke.py` — all-host process-disjoint GCS input proof
+- `src/sunfish_tpu/topology_smoke.py` — structured all-host topology/collective proof
+- `src/sunfish_tpu/seed_load_smoke.py` — real 8B target-sharded Orbax restore proof
+- `src/sunfish_tpu/real_resume_smoke.py` — production exact-next-update resume proof
+- `src/sunfish_tpu/preemption_gate.py` — exact-attempt kill/recovery orchestrator
+- `src/sunfish_tpu/smoke_evidence.py` — tiny-overfit and input-wait gate analyzer
+- `src/sunfish_tpu/readiness_ledger.py` — final eight-gate lineage/hash merger
+- `src/sunfish_tpu/deployment_config.py` — immutable Stage-0.5 config renderer
+- `src/sunfish_tpu/gcs_inventory.py` — generation/size/CRC pin for checkpoint prefixes
+- `src/sunfish_tpu/runtime_api_audit.py` — backend-free pinned private-API bootstrap audit
+- `src/sunfish_tpu/orbax_seed.py` — high-memory CPU JAX checkpoint pruning/exact-tree seed
+- `src/sunfish_tpu/seed_manifest.py` — pinned seed provenance and non-promotion enforcement
+- `src/sunfish_tpu/calibration_runner.py` — full-teacher 75M-token router calibration
+- `src/sunfish_tpu/reconstruction_gate.py` — 32E/48E layer-output pruning gate
+- `configs/training/stage05-first32-selection.json` — readiness-only, non-promotable 32-expert subset
 - `src/sunfish_tpu/training/` — strict Kauldron harness and prefix-amortized objective
 - `infra/tpu/README.md` — TPU VM bootstrap, access checklist, and launch gates
+- `scripts/upload_tpu_configs.sh` — all-worker config copy plus byte-hash verification
 - `infra/gcp/README.md` — GCP setup and cost guardrails (budget alerts, lifecycle, egress rules)
 - `src/sunfish/router_stats.py` — bucketized router-mass accumulation schema
 - `src/sunfish/expert_selection.py` — coverage-constrained expert selector
@@ -101,11 +120,10 @@ PYTHONPATH=src python -m sunfish.checkpoint_convert \
 PYTHONPATH=src python -m sunfish_tpu.training.train \
   --config configs/training/sunfish-smoke.toml --validate-only
 
-# On the requested v4-64 TPU VM, use scripts/bootstrap_tpu.sh so the exact
-# unreleased Gemma adapter commit is installed without floating dependencies.
-# Replace 64 with the measured global JAX device count if the grant differs.
-sunfish-tpu-preflight --require-tpu --expected-devices 64 \
-  --gcs-workdir gs://YOUR_BUCKET/sunfish/experiments --require-gcs --probe-gcs-read
+# Real TPU commands never run directly from this quickstart. Complete Stage-0
+# P1-P5, render the source-bound deployment bundle, then use the all-worker
+# bootstrap and ordered gauntlet in infra/tpu/README.md. The launcher rejects
+# templates, partial bundles, source drift, and missing parity evidence.
 ```
 
 ## Upstream references

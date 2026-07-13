@@ -21,8 +21,73 @@ from sunfish_tpu.tpu_preflight import (
     initialize_distributed_jax,
     report,
 )
+from sunfish_tpu.source_identity import (
+    normalize_source_identity,
+    require_launcher_run_id,
+    source_identity_from_environment,
+)
 
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def verify_checkpoint_evidence(
+    hosts: list[dict[str, object]],
+    *,
+    expected_devices: int,
+    expected_processes: int,
+    expected_local_devices: int,
+) -> dict[str, object]:
+    """Verify every process observed the same exact distributed round trip."""
+    errors: list[str] = []
+    if len(hosts) != expected_processes:
+        errors.append(f"found {len(hosts)} host reports; expected {expected_processes}")
+    indices = [host.get("process_index") for host in hosts]
+    if sorted(indices) != list(range(expected_processes)):
+        errors.append(f"process indices are {sorted(indices)}")
+    destinations = {host.get("destination") for host in hosts}
+    run_ids = {host.get("run_id") for host in hosts}
+    if len(destinations) != 1 or None in destinations:
+        errors.append("host checkpoint destinations differ")
+    if len(run_ids) != 1 or None in run_ids:
+        errors.append("host run IDs differ")
+    required_true = (
+        "ready",
+        "restored_addressable_shards_exact",
+        "next_loss_exact",
+        "next_gradients_exact",
+        "next_update_exact",
+    )
+    sources = [normalize_source_identity(host.get("sunfish_source")) for host in hosts]
+    if any(source is None for source in sources) or len(set(sources)) != 1:
+        errors.append("host source identities are missing or differ")
+    for host in hosts:
+        process = host.get("process_index")
+        if host.get("schema_version") != 1:
+            errors.append(f"process {process} has an unsupported schema")
+        if host.get("process_count") != expected_processes:
+            errors.append(f"process {process} reports the wrong process count")
+        if host.get("global_device_count") != expected_devices:
+            errors.append(f"process {process} reports the wrong global device count")
+        if host.get("local_device_count") != expected_local_devices:
+            errors.append(f"process {process} reports the wrong local device count")
+        topology = host.get("topology")
+        if not isinstance(topology, dict) or topology.get("ready") is not True:
+            errors.append(f"process {process} topology did not pass")
+        for key in required_true:
+            if host.get(key) is not True:
+                errors.append(f"process {process} {key}={host.get(key)!r}")
+    return {
+        "schema_version": 1,
+        "gates": [5],
+        "scope": "synthetic-sharded-state",
+        "run_id": next(iter(run_ids), None),
+        "destination": next(iter(destinations), None),
+        "passed": not errors,
+        "errors": errors,
+        "hosts": hosts,
+        "gate6_note": "real-trainer interrupted comparison is separately required",
+        "sunfish_source": hosts[0].get("sunfish_source") if hosts else None,
+    }
 
 
 def _resolve_mesh_shape(
@@ -287,6 +352,7 @@ def run_smoke(
 ) -> dict[str, object]:
     if not _RUN_ID.fullmatch(run_id):
         raise ValueError("run_id must contain only letters, numbers, dot, underscore, or dash")
+    require_launcher_run_id(run_id, required=require_tpu)
 
     # No backend-adjacent import may move above this call.
     jax, initialization = initialize_distributed_jax(require_distributed=require_tpu)
@@ -369,7 +435,9 @@ def run_smoke(
         )
 
     return {
+        "schema_version": 1,
         "ready": True,
+        "run_id": run_id,
         "destination": str(destination),
         "process_index": int(jax.process_index()),
         "process_count": int(jax.process_count()),
@@ -382,6 +450,9 @@ def run_smoke(
         "next_gradients_exact": gradients_exact,
         "next_update_exact": update_exact,
         "topology": topology_report,
+        "sunfish_source": source_identity_from_environment(
+            required=require_tpu
+        ),
     }
 
 
@@ -390,10 +461,58 @@ def _env_int(name: str, default: int) -> int:
     return default if value is None else int(value)
 
 
+def _write_immutable(path: Any, payload: dict[str, object]) -> None:
+    encoded = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    if path.exists():
+        if path.read_text() != encoded:
+            raise FileExistsError(f"immutable checkpoint evidence changed at {path}")
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(encoded)
+
+
+def write_checkpoint_evidence(
+    payload: dict[str, object],
+    *,
+    evidence_dir: str,
+    expected_devices: int,
+    expected_processes: int,
+    expected_local_devices: int,
+) -> dict[str, object]:
+    """Publish per-host evidence and an exact process-0 merged summary."""
+    from etils import epath
+    from jax.experimental import multihost_utils
+
+    run_id = str(payload["run_id"])
+    root = epath.Path(evidence_dir) / run_id
+    process_index = int(payload["process_index"])
+    _write_immutable(root / f"host-{process_index:05d}.json", payload)
+    multihost_utils.sync_global_devices(f"sunfish-checkpoint-evidence-{run_id}")
+    summary = None
+    if process_index == 0:
+        hosts = [
+            json.loads((root / f"host-{process:05d}.json").read_text())
+            for process in range(expected_processes)
+        ]
+        summary = verify_checkpoint_evidence(
+            hosts,
+            expected_devices=expected_devices,
+            expected_processes=expected_processes,
+            expected_local_devices=expected_local_devices,
+        )
+        _write_immutable(root / "summary.json", summary)
+    multihost_utils.sync_global_devices(f"sunfish-checkpoint-summary-{run_id}")
+    return summary if summary is not None else payload
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workdir", required=True, help="local path or gs://bucket/prefix")
     parser.add_argument("--run-id", required=True, help="unique identifier; never overwritten")
+    parser.add_argument(
+        "--evidence-dir",
+        help="local or gs:// prefix for immutable all-host evidence",
+    )
     parser.add_argument(
         "--allow-non-tpu",
         action="store_true",
@@ -417,20 +536,26 @@ def main() -> None:
         help="Phase-B data-axis size; 0 uses every global device",
     )
     args = parser.parse_args()
-    print(
-        json.dumps(
-            run_smoke(
-                args.workdir,
-                args.run_id,
-                require_tpu=not args.allow_non_tpu,
-                expected_devices=args.expected_devices,
-                expected_processes=args.expected_processes,
-                expected_local_devices=args.expected_local_devices,
-                data_axis_size=args.data_axis_size,
-            ),
-            indent=2,
-        )
+    payload = run_smoke(
+        args.workdir,
+        args.run_id,
+        require_tpu=not args.allow_non_tpu,
+        expected_devices=args.expected_devices,
+        expected_processes=args.expected_processes,
+        expected_local_devices=args.expected_local_devices,
+        data_axis_size=args.data_axis_size,
     )
+    if not args.allow_non_tpu and not args.evidence_dir:
+        parser.error("--evidence-dir is required for the TPU readiness gate")
+    if args.evidence_dir:
+        payload = write_checkpoint_evidence(
+            payload,
+            evidence_dir=args.evidence_dir,
+            expected_devices=args.expected_devices,
+            expected_processes=args.expected_processes,
+            expected_local_devices=args.expected_local_devices,
+        )
+    print(json.dumps(payload, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

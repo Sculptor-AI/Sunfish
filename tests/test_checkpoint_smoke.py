@@ -41,5 +41,47 @@ class CheckpointInitOrderTests(unittest.TestCase):
         initialize.assert_not_called()
 
 
+class CheckpointEvidenceTests(unittest.TestCase):
+    def test_all_host_evidence_requires_every_exact_comparison(self):
+        hosts = []
+        for process in range(2):
+            hosts.append(
+                {
+                    "schema_version": 1,
+                    "ready": True,
+                    "run_id": "resume-1",
+                    "destination": "gs://bucket/resume-1",
+                    "process_index": process,
+                    "process_count": 2,
+                    "global_device_count": 8,
+                    "local_device_count": 4,
+                    "topology": {"ready": True},
+                    "restored_addressable_shards_exact": True,
+                    "next_loss_exact": True,
+                    "next_gradients_exact": True,
+                    "next_update_exact": True,
+                    "sunfish_source": {
+                        "git_commit": "c" * 40,
+                        "source_tree_sha256": "d" * 64,
+                    },
+                }
+            )
+        result = checkpoint_smoke.verify_checkpoint_evidence(
+            hosts,
+            expected_devices=8,
+            expected_processes=2,
+            expected_local_devices=4,
+        )
+        self.assertTrue(result["passed"], result["errors"])
+        hosts[1]["next_gradients_exact"] = False
+        result = checkpoint_smoke.verify_checkpoint_evidence(
+            hosts,
+            expected_devices=8,
+            expected_processes=2,
+            expected_local_devices=4,
+        )
+        self.assertFalse(result["passed"])
+
+
 if __name__ == "__main__":
     unittest.main()

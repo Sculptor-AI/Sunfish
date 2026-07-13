@@ -34,15 +34,40 @@ tpu = [
   "orbax-checkpoint==0.12.1",
   "sentencepiece==0.2.1",
 ]
+parity = [
+  "accelerate==1.14.0",
+  "huggingface-hub==1.23.0",
+  "numpy==2.5.1",
+  "safetensors==0.8.0",
+  "sentencepiece==0.2.2",
+  "tokenizers==0.23.0",
+  "torch==2.13.0",
+  "transformers==5.13.0",
+]
 download = ["huggingface-hub>=0.34"]
 dev = []
+controller = ["etils[epath-gcs]==1.14.0", "google-cloud-storage==3.12.1"]
 
 [project.scripts]
 sunfish-audit = "sunfish.checkpoint_audit:main"
 sunfish-checkpoint-smoke = "sunfish_tpu.checkpoint_smoke:main"
 sunfish-convert = "sunfish.checkpoint_convert:main"
+sunfish-gcs-inventory = "sunfish_tpu.gcs_inventory:main"
+sunfish-input-smoke = "sunfish_tpu.input_smoke:main"
+sunfish-calibrate = "sunfish_tpu.calibration_runner:main"
+sunfish-smoke-evidence = "sunfish_tpu.smoke_evidence:main"
+sunfish-topology-smoke = "sunfish_tpu.topology_smoke:main"
 sunfish-kauldron = "sunfish_tpu.kauldron_launch:main"
+sunfish-orbax-seed = "sunfish_tpu.orbax_seed:main"
 sunfish-pack-training-records = "sunfish_tpu.training.pack_records:main"
+sunfish-parity = "sunfish_tpu.parity:main"
+sunfish-preemption-gate = "sunfish_tpu.preemption_gate:main"
+sunfish-real-resume-smoke = "sunfish_tpu.real_resume_smoke:main"
+sunfish-readiness-ledger = "sunfish_tpu.readiness_ledger:main"
+sunfish-render-tpu-configs = "sunfish_tpu.deployment_config:main"
+sunfish-reconstruction-gate = "sunfish_tpu.reconstruction_gate:main"
+sunfish-runtime-api-audit = "sunfish_tpu.runtime_api_audit:main"
+sunfish-seed-load-smoke = "sunfish_tpu.seed_load_smoke:main"
 sunfish-train = "sunfish_tpu.training.train:main"
 sunfish-tpu-preflight = "sunfish_tpu.tpu_preflight:main"
 

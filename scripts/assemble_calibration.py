@@ -91,6 +91,7 @@ def assemble_bucket(
     output_dir: Path,
     token_cap: int,
     min_doc_tokens: int = 16,
+    record_tokens: int = 768,
 ) -> dict:
     """Stream, tokenize, and write one bucket as an indexed immutable shard.
 
@@ -102,6 +103,7 @@ def assemble_bucket(
     from datasets import load_dataset
 
     from sunfish.datashards import ShardWriter
+    from sunfish.calibration_records import calibration_windows
 
     dataset_id, config, split = spec["dataset"]
     build = spec["build"]
@@ -117,9 +119,13 @@ def assemble_bucket(
         if not text or not text.strip():
             continue
         ids = tokenizer.encode(text).ids
-        if len(ids) < min_doc_tokens:
-            continue
-        writer.add(ids)
+        for record in calibration_windows(
+            ids,
+            record_tokens=record_tokens,
+            min_record_tokens=min_doc_tokens,
+            remaining_tokens=token_cap - writer.tokens,
+        ):
+            writer.add(record)
         if writer.tokens >= token_cap:
             break
     info = writer.close()
@@ -128,6 +134,7 @@ def assemble_bucket(
         "dataset": dataset_id,
         "config": config,
         "seconds": round(time.time() - started, 1),
+        "record_tokens": record_tokens,
         **info,
     }
 
@@ -136,7 +143,23 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokenizer", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--tokens-per-bucket", type=int, default=2_000_000)
+    budget = parser.add_mutually_exclusive_group(required=True)
+    budget.add_argument(
+        "--total-tokens",
+        type=int,
+        help="allocate this total with the exact docs/data.md workload shares",
+    )
+    budget.add_argument(
+        "--tokens-per-bucket",
+        type=int,
+        help="uniform per-bucket cap for a deliberately non-gating pilot",
+    )
+    parser.add_argument(
+        "--record-tokens",
+        type=int,
+        default=768,
+        help="fixed prompt+canvas window size consumed by calibration",
+    )
     parser.add_argument("--buckets", nargs="*", help="subset of buckets to build")
     args = parser.parse_args()
 
@@ -145,6 +168,7 @@ def main() -> None:
 
     from tokenizers import Tokenizer
 
+    from sunfish.calibration_records import calibration_bucket_token_caps
     from sunfish.datashards import write_manifest
 
     tokenizer = Tokenizer.from_file(str(args.tokenizer))
@@ -152,11 +176,22 @@ def main() -> None:
 
     results, failures = [], []
     wanted = args.buckets or list(SOURCES)
+    if args.total_tokens is not None:
+        bucket_caps = calibration_bucket_token_caps(args.total_tokens)
+    else:
+        if args.tokens_per_bucket <= 0:
+            parser.error("--tokens-per-bucket must be positive")
+        bucket_caps = {name: args.tokens_per_bucket for name in SOURCES}
     for name in wanted:
         spec = SOURCES[name]
         try:
             result = assemble_bucket(
-                name, spec, tokenizer, args.output, args.tokens_per_bucket
+                name,
+                spec,
+                tokenizer,
+                args.output,
+                bucket_caps[name],
+                record_tokens=args.record_tokens,
             )
             results.append(result)
             print(f"[ok] {name}: {result['tokens']:,} tokens / {result['records']:,} records "
@@ -170,7 +205,10 @@ def main() -> None:
         results,
         tokenizer=str(args.tokenizer),
         vocab_size=tokenizer.get_vocab_size(),
+        target_total_tokens=args.total_tokens,
         tokens_per_bucket_cap=args.tokens_per_bucket,
+        bucket_token_caps=bucket_caps,
+        record_tokens=args.record_tokens,
         failures=failures,
         purpose="stage-1 router calibration",
     )

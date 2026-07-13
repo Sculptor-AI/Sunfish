@@ -33,6 +33,11 @@ destroy even though the coding buckets never route to them. In
 `expert_selection.select_experts` they enter with low `bucket_weights` but a
 real `min_coverage` floor — down-weighted, not unprotected.
 
+The executable assembler enforces these shares by token count and splits
+documents into fixed 768-token records before writing the immutable manifest.
+That prevents long documents from inflating the advertised 75M budget while
+the TPU runner observes only their first prompt/canvas window.
+
 ## Recovery corpus (1-3B tokens, phase 5)
 
 Objective: the upstream uniform-state diffusion loss plus encoder AR loss on
