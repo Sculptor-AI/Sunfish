@@ -8,14 +8,8 @@ set -euo pipefail
 }
 PYTHON_BIN="${PYTHON_BIN:-python3.12}"
 VENV_DIR="${VENV_DIR:-.venv-tpu-controller}"
-GCLOUD_BIN="${SUNFISH_GCLOUD_BIN:-gcloud}"
-
-command -v "${GCLOUD_BIN}" >/dev/null 2>&1 || {
-  echo "gcloud CLI is required on the controller" >&2
-  exit 2
-}
-SUNFISH_GCLOUD_BIN="${GCLOUD_BIN}" scripts/tpu_iap.sh check-cli
-python3 scripts/check_tpu_release_safety.py
+SUNFISH_CONTROLLER_PYTHON="${PYTHON_BIN}" \
+  scripts/preflight_tpu_controller.sh --local-only
 "${PYTHON_BIN}" -m venv "${VENV_DIR}"
 "${VENV_DIR}/bin/python" -m pip install --upgrade pip
 "${VENV_DIR}/bin/python" -m pip install --requirement requirements-controller.lock

@@ -1,9 +1,12 @@
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 
 from sunfish.source_tree import _digest_source_names, workspace_source_identity
@@ -14,7 +17,9 @@ from sunfish_tpu.offline_bundle import (
     read_archive_sidecar,
     verify_bundle,
 )
+from sunfish_tpu.runtime_provenance import resolve_gemma_source_commit
 from sunfish_tpu.training.dependencies import (
+    GEMMA_SOURCE_COMMIT,
     RUNTIME_VERSIONS,
     TPU_ONLY_RUNTIME_VERSIONS,
 )
@@ -159,23 +164,109 @@ class OfflineBundleTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "invalid offline lock"):
                 parse_resolved_lock(path)
 
+    def test_worker_gemma_provenance_comes_from_verified_offline_bundle(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = self._bundle(Path(temporary))
+            archive_direct_url = mock.Mock()
+            archive_direct_url.read_text.return_value = json.dumps(
+                {
+                    "url": "file:///wheelhouse/gemma.whl",
+                    "archive_info": {"hash": "sha256=" + "a" * 64},
+                }
+            )
+            with mock.patch(
+                "sunfish_tpu.runtime_provenance.importlib.metadata.distribution",
+                return_value=archive_direct_url,
+            ) as distribution:
+                commit, provenance = resolve_gemma_source_commit(
+                    environment={"SUNFISH_OFFLINE_BUNDLE_ROOT": str(bundle)}
+                )
+            self.assertEqual(commit, GEMMA_SOURCE_COMMIT)
+            self.assertEqual(provenance, "verified-offline-bundle")
+            distribution.assert_not_called()
+
+    def test_archive_direct_url_is_not_mistaken_for_vcs_provenance(self):
+        distribution = mock.Mock()
+        distribution.read_text.return_value = json.dumps(
+            {
+                "url": "file:///wheelhouse/gemma.whl",
+                "archive_info": {"hash": "sha256=" + "a" * 64},
+            }
+        )
+        with mock.patch(
+            "sunfish_tpu.runtime_provenance.importlib.metadata.distribution",
+            return_value=distribution,
+        ):
+            self.assertEqual(
+                resolve_gemma_source_commit(environment={}),
+                (None, "direct-url"),
+            )
+
+    def test_offline_root_and_manifest_must_identify_the_same_bundle(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = self._bundle(root / "one")
+            other = self._bundle(root / "two")
+            with self.assertRaisesRegex(ValueError, "disagree"):
+                resolve_gemma_source_commit(
+                    environment={
+                        "SUNFISH_OFFLINE_BUNDLE_ROOT": str(bundle),
+                        "SUNFISH_OFFLINE_BUNDLE_MANIFEST": str(
+                            other / "offline-bundle.json"
+                        ),
+                    }
+                )
+
 
 class IapTransportTests(unittest.TestCase):
     @staticmethod
     def _environment(root: Path, capture: Path) -> dict[str, str]:
         fake = root / "gcloud"
         fake.write_text(
-            "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" >> \"$CAPTURE\"\n",
+            "#!/usr/bin/env bash\n"
+            "printf '%s\\n' \"$@\" >> \"$CAPTURE\"\n"
+            "case \"${1:-}\" in\n"
+            "  version) printf '{\"Google Cloud SDK\":\"%s\"}\\n' \"${GCLOUD_SDK_VERSION:-400.0.0}\" ;;\n"
+            "  auth) printf '%s\\n' \"${GCLOUD_ACTIVE_ACCOUNT:-operator@example.com}\" ;;\n"
+            "  config) printf '%s\\n' \"${GCLOUD_CONFIG_PROJECT:-sunfish-project}\" ;;\n"
+            "esac\n",
             encoding="utf-8",
         )
         fake.chmod(0o755)
+        python = root / "python3.12"
+        python.write_text(
+            "#!/usr/bin/env bash\n"
+            "if [[ \"$*\" == *\"sys.version_info[:2]\"* ]]; then exit 0; fi\n"
+            f"exec {shlex.quote(sys.executable)} \"$@\"\n",
+            encoding="utf-8",
+        )
+        python.chmod(0o755)
+        key = root / "google_compute_engine"
+        key.write_text("test-private-key\n", encoding="utf-8")
+        key.with_suffix(".pub").write_text(
+            "ssh-ed25519 AAAATEST sunfish-test\n", encoding="utf-8"
+        )
+        ssh_add = root / "ssh-add"
+        ssh_add.write_text(
+            "#!/usr/bin/env bash\nprintf 'ssh-ed25519 AAAATEST sunfish-test\\n'\n",
+            encoding="utf-8",
+        )
+        ssh_add.chmod(0o755)
         return {
             **os.environ,
             "CAPTURE": str(capture),
             "SUNFISH_GCLOUD_BIN": str(fake),
+            "SUNFISH_CONTROLLER_PYTHON": str(python),
+            "SUNFISH_SSH_ADD_BIN": str(ssh_add),
+            "SUNFISH_COMPUTE_SSH_KEY": str(key),
+            "SSH_AUTH_SOCK": str(root / "agent.sock"),
             "TPU_NAME": "sunfish-v4",
             "PROJECT_ID": "sunfish-project",
             "ZONE": "us-central2-b",
+            "SUNFISH_IAP_TUNNEL_ROLE_CONFIRMED": "1",
+            "SUNFISH_IAP_SSH_FIREWALL_CONFIRMED": "1",
+            "SUNFISH_PRIVATE_GOOGLE_ACCESS_CONFIRMED": "1",
+            "SUNFISH_GCS_IAM_CONFIRMED": "1",
         }
 
     def test_local_cli_check_needs_no_tpu_identity_and_performs_no_remote_action(self):
@@ -219,6 +310,11 @@ class IapTransportTests(unittest.TestCase):
                 "python3 -m pip install jax": "air-gapped worker",
                 "curl https://example.invalid": "air-gapped worker",
                 "scripts/bootstrap_parity.sh --connected-compute-host": "air-gapped worker",
+                "gcloud alpha compute tpus tpu-vm attach-disk sunfish-v4 --disk=d": "control-plane",
+                "gcloud alpha compute tpus tpu-vm detach-disk sunfish-v4 --disk=d": "control-plane",
+                "gcloud alpha compute tpus tpu-vm perform-maintenance sunfish-v4": "control-plane",
+                "gcloud alpha compute tpus tpu-vm simulate-maintenance-event sunfish-v4": "control-plane",
+                "gcloud alpha compute tpus tpu-vm describe sunfish-v4": "control-plane",
             }
             for command, message in forbidden.items():
                 with self.subTest(command=command):
@@ -278,7 +374,11 @@ class IapTransportTests(unittest.TestCase):
                 text=True,
             )
             arguments = capture.read_text(encoding="utf-8").splitlines()
-            self.assertEqual(arguments[:5], ["alpha", "compute", "tpus", "tpu-vm", "ssh"])
+            self.assertEqual(arguments[0], "version")
+            self.assertIn(
+                "alpha\ncompute\ntpus\ntpu-vm\nssh\n",
+                capture.read_text(encoding="utf-8"),
+            )
             self.assertIn("--worker=all", arguments)
             self.assertIn("--batch-size=all", arguments)
             self.assertIn("--tunnel-through-iap", arguments)
@@ -286,6 +386,33 @@ class IapTransportTests(unittest.TestCase):
             self.assertIn("python3.12", command)
             self.assertNotIn("jax", command.lower())
             self.assertNotIn("http", command.lower())
+
+    def test_controller_preflight_checks_version_account_project_key_and_confirmations(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            capture = root / "capture"
+            environment = self._environment(root, capture)
+            result = subprocess.run(
+                ["bash", str(ROOT / "scripts/preflight_tpu_controller.sh")],
+                cwd=ROOT,
+                env=environment,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertIn("without contacting TPU workers or GCS", result.stdout)
+
+            environment["GCLOUD_SDK_VERSION"] = "343.0.0"
+            result = subprocess.run(
+                ["bash", str(ROOT / "scripts/preflight_tpu_controller.sh")],
+                cwd=ROOT,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("too old", result.stderr)
 
     def test_offline_archive_deployer_uses_only_all_worker_iap(self):
         with tempfile.TemporaryDirectory() as temporary:

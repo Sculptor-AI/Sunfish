@@ -13,11 +13,11 @@ import ast
 import hashlib
 import importlib.metadata
 import json
-import os
 from pathlib import Path
 import tempfile
 from typing import Any, Mapping
 
+from sunfish_tpu.runtime_provenance import resolve_gemma_source_commit
 from sunfish_tpu.training.dependencies import (
     GEMMA_SOURCE_COMMIT,
     RUNTIME_VERSIONS,
@@ -465,29 +465,12 @@ def audit_installed_runtime_apis() -> dict[str, Any]:
             observed == expected,
             f"observed={observed}, expected={expected}",
         )
-    offline_manifest = os.environ.get("SUNFISH_OFFLINE_BUNDLE_MANIFEST")
     provenance = "direct-url"
-    if offline_manifest:
-        provenance = "verified-offline-bundle"
-        try:
-            from sunfish_tpu.offline_bundle import verify_bundle
-
-            bundle = verify_bundle(
-                Path(offline_manifest).resolve().parent,
-                verify_file_hashes=False,
-            )
-            installed_commit = bundle.get("gemma_source_commit")
-        except (OSError, RuntimeError, ValueError):
-            installed_commit = None
-    else:
-        try:
-            direct_url_text = importlib.metadata.distribution("gemma").read_text(
-                "direct_url.json"
-            )
-            direct_url = json.loads(direct_url_text or "{}")
-            installed_commit = direct_url.get("vcs_info", {}).get("commit_id")
-        except (importlib.metadata.PackageNotFoundError, json.JSONDecodeError):
-            installed_commit = None
+    try:
+        installed_commit, provenance = resolve_gemma_source_commit()
+    except (OSError, RuntimeError, ValueError):
+        installed_commit = None
+        provenance = "invalid-offline-bundle"
     _add(
         version_checks,
         "gemma:installed-source-commit",

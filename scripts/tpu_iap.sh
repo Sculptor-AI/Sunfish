@@ -31,11 +31,11 @@ case "${operation}" in
     }
     lower_command="$(printf '%s' "${command}" | tr '[:upper:]' '[:lower:]')"
     if [[ "${lower_command}" =~ (^|[[:space:];|&])(sudo[[:space:]]+)?(/(usr/)?s?bin/)?(shutdown|poweroff|reboot|halt|init|telinit)([[:space:];|&]|$) ]] || \
-       [[ "${lower_command}" =~ tpu-vm[[:space:]]+(create|start|stop|restart|reset|delete|update|suspend|resume) ]] || \
+       [[ "${lower_command}" =~ tpu-vm[[:space:]]+[a-z0-9-]+ ]] || \
        [[ "${lower_command}" =~ systemctl[^';|&']*(poweroff|reboot|halt|kexec|soft-reboot) ]] || \
        [[ "${lower_command}" =~ (^|[[:space:];|&])(sudo[[:space:]]+)?(/bin/)?kill[[:space:]][^';|&']*[[:space:]]1([[:space:];|&]|$) ]] || \
        [[ "${lower_command}" == *"/proc/sysrq-trigger"* ]]; then
-      echo "refusing a command that could alter the TPU VM allocation lifecycle" >&2
+      echo "refusing a TPU control-plane or allocation lifecycle command from a worker shell" >&2
       exit 2
     fi
     if [[ "${lower_command}" =~ https?://|git\+https ]] || \

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import importlib.metadata
 import importlib.util
-import json
 import os
 import re
 from typing import Any
@@ -21,6 +20,7 @@ from sunfish_tpu.training.dependencies import (
 from sunfish_tpu.training.spec import CheckpointFormat, HarnessConfig
 from sunfish_tpu.seed_manifest import validate_seed_manifest_bytes
 from sunfish_tpu.gcs_inventory import verify_live_gcs_inventory
+from sunfish_tpu.runtime_provenance import resolve_gemma_source_commit
 from sunfish_tpu.source_identity import (
     require_launcher_run_id,
     source_identity_from_environment,
@@ -49,18 +49,18 @@ def verify_runtime_contract(*, require_tpu: bool) -> dict[str, str]:
 
     if importlib.util.find_spec("gemma.diffusion.hackable_diffusion_adapter") is None:
         errors.append("Gemma DiffusionGemma training adapter is unavailable")
+    provenance = "direct-url"
     try:
-        direct_url_text = importlib.metadata.distribution("gemma").read_text(
-            "direct_url.json"
-        )
-        direct_url = json.loads(direct_url_text or "{}")
-        installed_commit = direct_url.get("vcs_info", {}).get("commit_id")
-    except (importlib.metadata.PackageNotFoundError, json.JSONDecodeError):
+        installed_commit, provenance = resolve_gemma_source_commit()
+    except (OSError, RuntimeError, ValueError) as error:
         installed_commit = None
+        provenance = "invalid-offline-bundle"
+        errors.append(f"Gemma source provenance could not be verified: {error}")
     if installed_commit != GEMMA_SOURCE_COMMIT:
         errors.append(
             "gemma source commit is "
-            f"{installed_commit or 'unrecorded'}, expected {GEMMA_SOURCE_COMMIT}"
+            f"{installed_commit or 'unrecorded'}, expected {GEMMA_SOURCE_COMMIT} "
+            f"({provenance})"
         )
     if errors:
         raise RuntimeError("training runtime contract failed: " + "; ".join(errors))

@@ -20,6 +20,21 @@ WORKER_SCRIPTS = (
     SCRIPTS / "tpu_host_entrypoint.sh",
     SCRIPTS / "upload_tpu_configs.sh",
 )
+MUTATING_TPU_VM_COMMANDS = (
+    "attach-disk",
+    "create",
+    "delete",
+    "detach-disk",
+    "perform-maintenance",
+    "reset",
+    "restart",
+    "resume",
+    "simulate-maintenance-event",
+    "start",
+    "stop",
+    "suspend",
+    "update",
+)
 
 
 def fail(message: str) -> None:
@@ -37,6 +52,8 @@ def main() -> int:
     ):
         if token not in wrapper:
             fail(f"IAP transport wrapper is missing {token!r}")
+    if "tpu-vm[[:space:]]+[a-z0-9-]+" not in wrapper:
+        fail("IAP transport wrapper does not fail closed on worker control-plane commands")
 
     for path in WORKER_SCRIPTS:
         text = path.read_text(encoding="utf-8")
@@ -70,10 +87,18 @@ def main() -> int:
         SCRIPTS / "bootstrap_seed_cpu.sh",
         SCRIPTS / "bootstrap_parity.sh",
         SCRIPTS / "bootstrap_tpu_controller.sh",
+        SCRIPTS / "preflight_tpu_controller.sh",
     )
     for path in connected_only:
         if "SUNFISH_TPU_WORKER" not in path.read_text(encoding="utf-8"):
             fail(f"connected-only script lacks a TPU-worker refusal: {path.name}")
+
+    probe = (SCRIPTS / "probe_tpu_worker_base.sh").read_text(encoding="utf-8")
+    if (
+        "preflight_tpu_controller.sh" not in probe
+        or probe.index("preflight_tpu_controller.sh") > probe.index("tpu_iap.sh")
+    ):
+        fail("base-image probe does not run controller preflight before TPU contact")
 
     implementation_files = [
         *SCRIPTS.glob("*.sh"),
@@ -84,14 +109,12 @@ def main() -> int:
         text = path.read_text(encoding="utf-8")
         if path.resolve() in {IAP_WRAPPER.resolve(), SELF}:
             continue
-        if re.search(r"\btpu-vm\s+(?:ssh|scp)\b", text):
-            fail(f"implementation bypasses the guarded IAP transport: {path}")
         if re.search(
-            r"tpu-vm\s+(?:create|start|stop|restart|reset|delete|update|suspend|resume)\b",
+            r"\bgcloud(?:\s+alpha)?\s+compute\s+tpus\s+tpu-vm\s+[a-z0-9-]+\b",
             text,
             re.IGNORECASE,
         ):
-            fail(f"implementation contains a TPU allocation lifecycle operation: {path}")
+            fail(f"implementation bypasses the guarded TPU control plane: {path}")
 
     operational_docs = (
         ROOT / "AGENTS.md",
@@ -104,9 +127,10 @@ def main() -> int:
         ROOT / "coordination/external_tpu_review.md",
         ROOT / "reference/tpu-docs/tpu-pod-launch.md",
     )
+    mutating_commands = "|".join(re.escape(name) for name in MUTATING_TPU_VM_COMMANDS)
     lifecycle = re.compile(
         r"gcloud(?:\s+alpha)?\s+compute\s+tpus\s+tpu-vm\s+"
-        r"(?:create|start|stop|restart|reset|delete|update|suspend|resume)\b",
+        rf"(?:{mutating_commands})\b",
         re.IGNORECASE,
     )
     for path in operational_docs:

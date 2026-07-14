@@ -85,6 +85,7 @@ if [[ -f .sunfish-release.json ]]; then
     exit 2
   fi
   export SUNFISH_OFFLINE_BUNDLE_ROOT="${derived_bundle_root}"
+  export SUNFISH_OFFLINE_BUNDLE_MANIFEST="${derived_bundle_root}/offline-bundle.json"
 fi
 (($#)) || { echo "missing host command" >&2; exit 2; }
 

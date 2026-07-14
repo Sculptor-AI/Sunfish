@@ -12,6 +12,7 @@ min_free_bytes="${SUNFISH_MIN_FREE_BYTES:-21474836480}"
   exit 2
 }
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+"${script_dir}/preflight_tpu_controller.sh"
 log_dir="${SUNFISH_CONTROLLER_LOG_DIR:-tpu-launch-logs}/base-image-probe"
 mkdir -p "${log_dir}"
 

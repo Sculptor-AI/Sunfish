@@ -19,8 +19,10 @@ done
   echo "offline bundle must be an existing nonempty absolute path" >&2
   exit 2
 }
-[[ "${remote_dir}" == /* && "${remote_dir}" != *$'\n'* ]] || {
-  echo "remote bundle directory must be absolute and one line" >&2
+[[ "${remote_dir}" == /* && "${remote_dir}" != "/" && "${remote_dir}" != */ && \
+   "${remote_dir}" != *"/../"* && "${remote_dir}" != *"/.." && \
+   "${remote_dir}" != *$'\n'* ]] || {
+  echo "remote bundle directory must be a normalized non-root absolute path" >&2
   exit 2
 }
 sidecar="${bundle}.sha256"
@@ -43,23 +45,27 @@ source_tree_sha256="$("${controller_python}" "${root}/scripts/source_tree_digest
 }
 
 quote_arg() { printf '%q' "$1"; }
-remote_parent="${remote_dir%/*}"
-[[ -n "${remote_parent}" ]] || remote_parent="/"
 remote_temp="${remote_dir}.upload-${expected_sha:0:16}"
 remote_archive="${remote_temp}/bundle.tar"
+upload_helper_path="${root}/src/sunfish_tpu/upload_transaction.py"
+upload_helper_b64="$("${controller_python}" -c \
+  'import base64,pathlib,sys; print(base64.b64encode(pathlib.Path(sys.argv[1]).read_bytes()).decode("ascii"))' \
+  "${upload_helper_path}")"
+upload_helper_bootstrap='import base64,sys; source=base64.b64decode(sys.argv.pop(1),validate=True); exec(compile(source,"sunfish-upload-transaction.py","exec"))'
+upload_helper="$(quote_arg "${remote_python}") -c $(quote_arg "${upload_helper_bootstrap}") $(quote_arg "${upload_helper_b64}")"
 
-prepare="test ! -e $(quote_arg "${remote_dir}")"
-prepare+=" && test ! -e $(quote_arg "${remote_temp}")"
-prepare+=" && mkdir -p $(quote_arg "${remote_parent}")"
-prepare+=" && mkdir $(quote_arg "${remote_temp}")"
+prepare="${upload_helper} prepare"
+prepare+=" --final $(quote_arg "${remote_dir}")"
+prepare+=" --identity $(quote_arg "${expected_sha}")"
 "${iap}" ssh-all --command "${prepare}"
 "${iap}" scp-all "${bundle}" "${remote_archive}"
 
-hash_program='import hashlib,pathlib,sys; p=pathlib.Path(sys.argv[1]); h=hashlib.sha256(); f=p.open("rb"); [h.update(c) for c in iter(lambda:f.read(1048576), b"")]; f.close(); raise SystemExit(0 if h.hexdigest()==sys.argv[2] else 1)'
 extract_program='import pathlib,tarfile,sys; a=pathlib.Path(sys.argv[1]); d=pathlib.Path(sys.argv[2]); t=tarfile.open(a,"r"); m=t.getmembers(); ok=bool(m) and all(not pathlib.PurePosixPath(x.name).is_absolute() and ".." not in pathlib.PurePosixPath(x.name).parts and (x.name=="sunfish-tpu-offline" or x.name.startswith("sunfish-tpu-offline/")) for x in m); sys.exit(3) if not ok else None; t.extractall(d,filter="data"); t.close()'
 extracted="${remote_temp}/sunfish-tpu-offline"
-finalize="$(quote_arg "${remote_python}") -c $(quote_arg "${hash_program}")"
-finalize+=" $(quote_arg "${remote_archive}") $(quote_arg "${expected_sha}")"
+finalize="${upload_helper} verify-file"
+finalize+=" --final $(quote_arg "${remote_dir}")"
+finalize+=" --identity $(quote_arg "${expected_sha}")"
+finalize+=" --name bundle.tar --sha256 $(quote_arg "${expected_sha}")"
 finalize+=" && $(quote_arg "${remote_python}") -c $(quote_arg "${extract_program}")"
 finalize+=" $(quote_arg "${remote_archive}") $(quote_arg "${remote_temp}")"
 finalize+=" && cd $(quote_arg "${extracted}/source")"
@@ -67,10 +73,17 @@ finalize+=" && PYTHONPATH=src $(quote_arg "${remote_python}") -m sunfish_tpu.off
 finalize+=" --bundle-root $(quote_arg "${extracted}")"
 finalize+=" --expected-commit $(quote_arg "${git_commit}")"
 finalize+=" --expected-tree $(quote_arg "${source_tree_sha256}")"
-finalize+=" && test ! -e $(quote_arg "${remote_dir}")"
-finalize+=" && mv $(quote_arg "${extracted}") $(quote_arg "${remote_dir}")"
-finalize+=" && $(quote_arg "${remote_python}") -c $(quote_arg 'import pathlib,sys; pathlib.Path(sys.argv[1]).unlink(); pathlib.Path(sys.argv[2]).rmdir()')"
-finalize+=" $(quote_arg "${remote_archive}") $(quote_arg "${remote_temp}")"
+finalize+=" && if test -e $(quote_arg "${remote_dir}") || test -L $(quote_arg "${remote_dir}"); then"
+finalize+=" test -d $(quote_arg "${remote_dir}") && test ! -L $(quote_arg "${remote_dir}")"
+finalize+=" && cd $(quote_arg "${remote_dir}/source")"
+finalize+=" && PYTHONPATH=src $(quote_arg "${remote_python}") -m sunfish_tpu.offline_bundle verify"
+finalize+=" --bundle-root $(quote_arg "${remote_dir}")"
+finalize+=" --expected-commit $(quote_arg "${git_commit}")"
+finalize+=" --expected-tree $(quote_arg "${source_tree_sha256}");"
+finalize+=" else mv $(quote_arg "${extracted}") $(quote_arg "${remote_dir}"); fi"
+finalize+=" && ${upload_helper} cleanup"
+finalize+=" --final $(quote_arg "${remote_dir}")"
+finalize+=" --identity $(quote_arg "${expected_sha}")"
 "${iap}" ssh-all --command "${finalize}"
 
 echo "offline TPU bundle published on every worker: ${remote_dir}"

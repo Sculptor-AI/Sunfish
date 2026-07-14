@@ -62,6 +62,9 @@ class TpuDependencyLockTests(unittest.TestCase):
         base = (root / "requirements-tpu-base.lock").read_text(encoding="utf-8")
         source = (root / "requirements-gemma-source.lock").read_text(encoding="utf-8")
         bootstrap = (root / "scripts/bootstrap_tpu.sh").read_text(encoding="utf-8")
+        host_entrypoint = (root / "scripts/tpu_host_entrypoint.sh").read_text(
+            encoding="utf-8"
+        )
         builder = (root / "scripts/build_tpu_offline_bundle.sh").read_text(
             encoding="utf-8"
         )
@@ -86,6 +89,7 @@ class TpuDependencyLockTests(unittest.TestCase):
         self.assertIn('"${wheel_files[@]}"', builder)
         self.assertIn("-m pip check", builder)
         self.assertIn("sunfish-runtime-api-audit", bootstrap)
+        self.assertIn("SUNFISH_OFFLINE_BUNDLE_MANIFEST", host_entrypoint)
         self.assertLess(
             bootstrap.index("sunfish-runtime-api-audit"),
             bootstrap.index("sunfish-tpu-preflight"),

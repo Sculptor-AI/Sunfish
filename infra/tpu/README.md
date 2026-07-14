@@ -47,7 +47,8 @@ rejects a config bundle without a strictly validated all-pass P1-P5 report.
 From the authenticated controller, first prove IAP reaches every worker and
 that the immutable VM image already supplies Linux x86_64 CPython 3.12,
 `venv`/`ensurepip`, safe tar extraction, and enough free disk. This probe does
-not import JAX or contact any network endpoint from a worker:
+not import JAX or contact any public network endpoint from a worker. Before it
+contacts a worker, it runs the controller preflight described below:
 
 ```bash
 export TPU_NAME=YOUR_TPU_NAME
@@ -87,18 +88,46 @@ controller. The workers receive no credentials and resolve no dependencies.
 ### 2. Configure the non-compute controller
 
 The controller is Chase's laptop, Cloud Shell, or another non-compute machine
-with the repository and authenticated `gcloud` CLI. It does not install JAX
-or run model code:
+with the repository, CPython 3.12, Google Cloud SDK >=344, and one authenticated
+`gcloud` account. It does not install JAX or run model code. Configure the
+target before the first worker probe; every operational command still passes
+the same project and zone explicitly:
 
 ```bash
-PYTHON_BIN=python3.12 VENV_DIR=.venv-tpu-controller \
-  scripts/bootstrap_tpu_controller.sh
 export TPU_NAME=YOUR_TPU_NAME
 export PROJECT_ID=YOUR_PROJECT
 export ZONE=YOUR_ZONE
+gcloud config set project "$PROJECT_ID"
+
+# Required by gcloud's all-worker TPU VM SSH path. Generate the normal Compute
+# Engine key first if the authenticated controller does not already have it.
+test -f "$HOME/.ssh/google_compute_engine"
+ssh-add "$HOME/.ssh/google_compute_engine"
+
+PYTHON_BIN=python3.12 VENV_DIR=.venv-tpu-controller \
+  scripts/bootstrap_tpu_controller.sh
+
+# Set these only after the allocation owner has verified each cloud-side fact:
+# roles/iap.tunnelResourceAccessor (directly or inherited), TCP/22 ingress from
+# 35.235.240.0/20, Private Google Access on the TPU subnet, and least-privilege
+# GCS access for the attached TPU service account on the exact Sunfish prefixes.
+export SUNFISH_IAP_TUNNEL_ROLE_CONFIRMED=1
+export SUNFISH_IAP_SSH_FIREWALL_CONFIRMED=1
+export SUNFISH_PRIVATE_GOOGLE_ACCESS_CONFIRMED=1
+export SUNFISH_GCS_IAM_CONFIRMED=1
+scripts/preflight_tpu_controller.sh
+
 export SUNFISH_OFFLINE_ARCHIVE=/absolute/path/sunfish-tpu-offline-COMMIT.tar
 export SUNFISH_REMOTE_RELEASE_DIR=/home/YOUR_USER/sunfish-releases/COMMIT
 ```
+
+The preflight reads only local CLI configuration, authentication metadata,
+the SSH agent, and the committed safety policy. It checks the exact Python
+minor version, minimum SDK version, alpha SSH/SCP surface, one active account,
+configured project, target formats, the loaded `google_compute_engine` key,
+and all four owner confirmations. It does not SSH, SCP, inspect a TPU, or read
+a bucket. `probe_tpu_worker_base.sh` runs it again and is the first permitted
+TPU contact; do not bypass that probe.
 
 The controller launches every worker simultaneously and reads immutable GCS
 evidence. The TPU virtualenv below exists only on TPU workers.
@@ -119,8 +148,11 @@ allocation: `gcloud alpha compute tpus tpu-vm ssh --worker=all
 --batch-size=all --tunnel-through-iap` and `gcloud alpha compute tpus tpu-vm
 scp --worker=all --tunnel-through-iap`. The single archive is copied to every
 worker, SHA-256 checked there, safely unpacked, inventory-verified, and
-atomically published into a previously nonexistent release directory. It
-never contacts a package index and never invokes a TPU lifecycle operation.
+atomically published. The staging path is content-addressed and carries an
+exact release marker: rerunning the same command reconciles partial workers,
+accepts already-published byte-identical workers, and refuses an unmarked
+staging path or divergent final directory. It never contacts a package index
+and never invokes a TPU lifecycle operation.
 
 The launcher pins both the 40-character Git commit and a deterministic SHA-256 over the deployable
 surface: `src/`, `scripts/`, `configs/`, exact lock files, `pyproject.toml`,
@@ -221,8 +253,10 @@ The renderer validates all three strict TOMLs, proves they differ only in
 run ID/workdir, validates P1-P5 exactness, and records template,
 canonical-config, raw-file, parity-report, and source hashes. The uploader
 copies and hash-verifies all five bundle files into a temporary directory on
-every worker, then atomically publishes a previously nonexistent remote
-directory. `--config` always names the controller copy; `--remote-config` names
+every worker, then atomically publishes them with the same content-addressed
+retry protocol as the release bundle. An exact retry is safe after partial
+all-worker SCP or finalization; a divergent final directory is never replaced.
+`--config` always names the controller copy; `--remote-config` names
 the worker copy. The launcher rejects a rendered config whose bytes,
 canonical digest, run identity, or source identity no longer matches its
 sibling bundle manifest. It validates every config in the bundle, even when

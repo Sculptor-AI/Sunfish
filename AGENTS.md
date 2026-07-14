@@ -287,3 +287,21 @@ shells, bytecode, notebook JSON, executable bits, and `git diff --check` all
 green. The connected Linux archive build, real all-worker deployment, Stage-0
 P2-P5, seed materialization, and hardware readiness gates remain unrun; TPU
 readiness is still 0/8.
+
+**Deployment audit closure (Codex, 2026-07-14):** a fresh no-hardware audit
+found and repaired four remaining controller/release defects. Worker runtime
+Gemma provenance now comes from the verified offline-bundle manifest (a local
+wheel's PEP 610 record is intentionally not treated as VCS provenance). The
+IAP wrapper fails closed on every TPU control-plane command issued from a
+worker shell, including disk and maintenance mutators. Bundle and config
+uploads now use a dependency-free, content-addressed marked transaction that
+reconciles partial all-worker retries, accepts exact published results, and
+refuses unmarked or divergent paths. A mandatory pre-probe controller check
+now validates CPython 3.12, Google Cloud SDK >=344, the alpha SSH/SCP surface,
+one active account and matching project, the loaded Compute Engine SSH key,
+and explicit allocation-owner confirmation of IAP tunnel/firewall, Private
+Google Access, and exact-prefix GCS IAM. It performs no TPU or bucket access.
+Local verification is **229 tests green with 21 intentional heavy-stack
+skips**, 21 CLI help checks, five strict TOMLs, all 13 shell scripts, static
+release safety, bytecode, notebook JSON, executable bits, and `git diff
+--check` green. Hardware readiness remains 0/8; no TPU or bucket was touched.

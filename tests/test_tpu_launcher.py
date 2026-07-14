@@ -82,8 +82,8 @@ class AllHostLauncherTests(unittest.TestCase):
             self.assertIn("sunfish-preemption-smoke.toml", calls)
             self.assertIn("/home/sunfish/deploy/grant-001", calls)
             self.assertIn(".upload-", calls)
-            self.assertIn("test ! -e", calls)
-            self.assertIn("mv", calls)
+            self.assertIn("prepare", calls)
+            self.assertIn("publish-files", calls)
 
     def test_uploader_refuses_tampered_bundle_before_gcloud(self):
         root = Path(__file__).resolve().parents[1]
