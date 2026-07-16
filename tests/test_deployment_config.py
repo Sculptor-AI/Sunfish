@@ -61,6 +61,7 @@ class DeploymentConfigTests(unittest.TestCase):
                 )
                 self.assertEqual(config.checkpoint.init_manifest_sha256, "b" * 64)
                 self.assertEqual(config.topology.expected_devices, 32)
+                self.assertEqual(config.data.global_batch_size, 32)
             on_disk = json.loads((output / "rendered-configs.json").read_text())
             self.assertEqual(on_disk, payload)
             self.assertEqual(payload["stage0_parity"]["p1_tensors_compared"], 691)
@@ -163,6 +164,43 @@ class DeploymentConfigTests(unittest.TestCase):
             base["output_directory"].mkdir()
             with self.assertRaises(FileExistsError):
                 render_stage05_configs(**base)
+
+    def test_smaller_grant_keeps_one_readiness_example_per_device(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_path = Path(temporary)
+            output = temporary_path / "bundle"
+            payload = render_stage05_configs(
+                template_directory=ROOT / "configs/training",
+                output_directory=output,
+                storage_root="gs://bucket/sunfish",
+                run_tag="grant-v4-32",
+                dataset_manifest_sha256="a" * 64,
+                seed_manifest_sha256="b" * 64,
+                parity_report_path=self._parity_report(temporary_path),
+                expected_devices=16,
+                expected_processes=4,
+                expected_local_devices=4,
+                source_root=ROOT,
+            )
+            self.assertEqual(payload["readiness_global_batch_size"], 16)
+            for filename in (
+                "sunfish-smoke.toml",
+                "sunfish-resume-smoke.toml",
+                "sunfish-preemption-smoke.toml",
+            ):
+                config = HarnessConfig.load(output / filename)
+                self.assertEqual(config.data.global_batch_size, 16)
+                self.assertEqual(config.topology.expected_devices, 16)
+
+            payload["readiness_global_batch_size"] = 32
+            (output / "rendered-configs.json").write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "readiness batch"):
+                validate_rendered_config_file(
+                    output / "sunfish-smoke.toml", source_root=ROOT
+                )
 
 
 if __name__ == "__main__":

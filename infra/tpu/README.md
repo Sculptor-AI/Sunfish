@@ -32,12 +32,14 @@ Orbax. The seed sidecar pins every source/output GCS object's generation,
 size, and CRC32C; every TPU restore revalidates the output inventory. See
 `docs/training_harness.md` for the exact-tree command and manifest.
 
-Before any TPU command, Stage-0 P1-P5 must be green. P1 is already recorded in
-`evals/stage0/parity-p1-report.json`; execute P2-P5 on a high-memory CPU host
+Before any TPU command, Stage-0 P1-P5 must be green. The tensor comparison
+behind `evals/stage0/parity-p1-report.json` passed, but that file uses the
+legacy schema and has no deployable-source identity, so it is not promotable
+evidence. Regenerate P1 and execute P2-P5 together on a high-memory CPU host
 with `sunfish-parity` exactly as documented in `docs/parity_harness.md`, then
-upload its report/traces/environment record. Do not substitute TPU/JAX outputs
-for this same-framework conversion gate. The final report must come from the
-same deployable source identity that will be launched; every TPU launcher now
+upload the final report/traces/environment record. Do not substitute TPU/JAX
+outputs for this same-framework conversion gate. The report must come from
+the exact deployable source identity that will be launched; every TPU launcher
 rejects a config bundle without a strictly validated all-pass P1-P5 report.
 
 ## Fully ordered air-gapped bootstrap
@@ -45,10 +47,12 @@ rejects a config bundle without a strictly validated all-pass P1-P5 report.
 ### 1. Probe the base image, then build away from the TPU pod
 
 From the authenticated controller, first prove IAP reaches every worker and
-that the immutable VM image already supplies Linux x86_64 CPython 3.12,
-`venv`/`ensurepip`, safe tar extraction, and enough free disk. This probe does
-not import JAX or contact any public network endpoint from a worker. Before it
-contacts a worker, it runs the controller preflight described below:
+that the immutable VM image supplies Linux x86_64, glibc, stock CPython 3.10 or
+newer for the dependency-free predeploy helpers, and enough free disk. The
+stock interpreter is not the training runtime and need not provide `venv` or
+`ensurepip`. This probe does not import JAX or contact any public network
+endpoint from a worker. Before it contacts a worker, it runs the controller
+preflight described below:
 
 ```bash
 export TPU_NAME=YOUR_TPU_NAME
@@ -59,17 +63,28 @@ scripts/probe_tpu_worker_base.sh
 
 The probe defaults to a 20 GiB free-space floor. Override
 `SUNFISH_MIN_FREE_BYTES` only from an allocation-owner-approved disk budget;
-the probe fails the all-worker command if any host is below it.
+the probe fails the all-worker command if any host is below it. It also rejects
+every nonempty `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY` setting (including
+lowercase forms) because a worker proxy can make distributed JAX initialization
+stall before useful diagnostics exist.
 
 If any worker lacks that base, stop here and ask the allocation owner for a
-compatible image; do not apt-install, reboot, reset, or recreate the pod. Use a
-connected packaging host with a compatible Linux/glibc ABI. Third-party
-runtime packages must arrive as prebuilt wheels; the builder refuses source
-distributions rather than compiling them against an accidental host ABI.
+compatible image; do not apt-install, reboot, reset, or recreate the pod. Do
+not assume an Ubuntu 22.04 image label is sufficient: the probe is the
+authority. A stock CPython 3.10 image is supported: the exact training
+interpreter arrives inside the immutable release. Use a connected glibc Linux
+x86_64 packaging host with stock CPython 3.10 or newer. Third-party runtime
+packages must arrive as prebuilt wheels; the builder refuses source
+distributions rather than compiling them against an accidental host ABI. The
+bundle derives its minimum glibc version from every native wheel's versioned
+manylinux tags; deployment and bootstrap reject an older worker before
+importing JAX.
+Unversioned `linux_x86_64` wheels are rejected because they carry no portable
+glibc contract.
 
-Use an internet-connected Linux x86_64 CPython 3.12 packaging host such as
-Colab, Kaggle, Cloud Build, or a disposable CPU VM. Do not build this large
-wheelhouse on Chase's laptop, and never run the builder on a TPU worker:
+Use an internet-connected Linux x86_64 packaging host such as Colab, Kaggle,
+Cloud Build, or a disposable CPU VM. Do not build this large wheelhouse on
+Chase's laptop, and never run the builder on a TPU worker:
 
 ```bash
 # Clean committed checkout on the connected packaging host.
@@ -79,11 +94,17 @@ scripts/build_tpu_offline_bundle.sh \
 ```
 
 The builder is the only TPU release path allowed to contact PyPI or GitHub. It
-resolves/builds Linux wheels, builds Gemma from the audited 40-character
-source commit, builds the Sunfish wheel, creates a fully resolved URL-free
-lock, reconstructs and audits a fresh environment with `PIP_NO_INDEX=1`, and
-emits the archive plus `.sha256` sidecar. Copy those two files back to the
-controller. The workers receive no credentials and resolve no dependencies.
+first downloads python-build-standalone release `20260623`, exact
+`cpython-3.12.13+20260623-x86_64-unknown-linux-gnu-install_only.tar.gz`
+(111,146,559 bytes; SHA-256
+`9fa869d69be54f6b8eeae64272fbd9bb0646e0e1a8da9d80e51ba5a3bee48930`).
+It verifies that asset before execution and uses only its
+`python/bin/python3` to resolve/build Linux wheels, build Gemma from the
+audited 40-character source commit, build the Sunfish wheel, create the fully
+resolved URL-free lock, and reconstruct/audit a fresh environment with
+`PIP_NO_INDEX=1`. The exact runtime archive and URL-free metadata are part of
+the immutable bundle. Copy the resulting archive and `.sha256` sidecar back
+to the controller. Workers receive no credentials and resolve no dependencies.
 
 ### 2. Configure the non-compute controller
 
@@ -148,11 +169,17 @@ allocation: `gcloud alpha compute tpus tpu-vm ssh --worker=all
 --batch-size=all --tunnel-through-iap` and `gcloud alpha compute tpus tpu-vm
 scp --worker=all --tunnel-through-iap`. The single archive is copied to every
 worker, SHA-256 checked there, safely unpacked, inventory-verified, and
-atomically published. The staging path is content-addressed and carries an
-exact release marker: rerunning the same command reconciles partial workers,
-accepts already-published byte-identical workers, and refuses an unmarked
-staging path or divergent final directory. It never contacts a package index
-and never invokes a TPU lifecycle operation.
+atomically published. Before the runtime exists, extraction uses only the
+stock-Python-compatible embedded upload/runtime helpers: they reject absolute
+paths, traversal, devices, FIFOs, unsafe links, duplicate members, and
+unbounded archive expansion. They verify the pinned runtime archive and
+manifest binding, derive `python/` transactionally, hash-bind the installed
+tree, and prove it is exact CPython 3.12.13. A second check runs the full bundle
+verifier with that interpreter. The staging path is content-addressed and
+carries an exact release marker: rerunning the same command reconciles partial
+workers, accepts already-published byte-identical workers, and refuses an
+unmarked staging path or divergent final directory. It never contacts a
+package index and never invokes a TPU lifecycle operation.
 
 The launcher pins both the 40-character Git commit and a deterministic SHA-256 over the deployable
 surface: `src/`, `scripts/`, `configs/`, exact lock files, `pyproject.toml`,
@@ -165,14 +192,17 @@ refuses the launch on any mismatch. The exported source carries a local
 or GitHub access. Generated bytecode, logs, and virtualenvs are ignored and do
 not perturb the identity.
 
-The bootstrap uses Python 3.12, the exact TPU stack in
+The bootstrap and host/config entrypoints default to the deployed
+`$SUNFISH_OFFLINE_BUNDLE_ROOT/python/bin/python3` (exact CPython 3.12.13), then
+use the exact TPU stack in
 the bundle's `offline-requirements.lock` and exact Gemma source commit
 `09e7b48ae88720f6236b8266c7213eb51bb62b87`. Worker pip is forced to
 `PIP_NO_INDEX=1`, `--no-index`, `--no-deps`, `--only-binary=:all:`, and the
 local wheelhouse. `--no-deps` is mandatory because Gemma's wheel metadata
 contains an online Git dependency; every transitive distribution is already
-enumerated in the generated lock. The runtime checks the source-bound bundle
-manifest and every resolved installed version before training. Before any backend import,
+enumerated in the generated lock. The runtime checks the source-bound bundle,
+its wheel-derived glibc floor, the proxy-free worker environment, and every
+resolved installed version before training. Before any backend import,
 bootstrap also
 runs `sunfish-runtime-api-audit`: it parses the installed source files for the
 reviewed Gemma/Kauldron/Orbax private signatures and checkpoint/cursor/metric
@@ -261,6 +291,13 @@ the worker copy. The launcher rejects a rendered config whose bytes,
 canonical digest, run identity, or source identity no longer matches its
 sibling bundle manifest. It validates every config in the bundle, even when
 only one is being launched, and refuses an ordinary tracked template.
+The renderer also replaces the template batch with the measured global JAX
+device count, keeping every readiness run at one example per device. This is
+load-bearing on a smaller grant: merely changing a v4-64 template's topology
+to v4-32 while leaving batch 32 would double per-device activations. Router
+and recovery templates remain the approved v4-64 profile; if the granted
+topology differs, do not launch them until a new source-bound production
+config uses one example per device and its HBM pilot passes.
 
 Run `scripts/bootstrap_tpu.sh` concurrently on every worker through the same
 launcher used for jobs:
@@ -279,8 +316,9 @@ scripts/launch_tpu_pod.sh \
 ```
 
 Its ordering is
-binding: verify archive/source/wheel inventory → create environment → offline
-no-index wheel install → exact installed-environment comparison → static
+binding: stock-Python verification of the installed standalone runtime →
+standalone-Python verification of archive/source/wheel inventory → create
+environment → offline no-index wheel install → exact installed-environment comparison → static
 runtime API audit → distributed JAX init → topology and real collective → GCS
 read/list probe → record `pip freeze`.
 The first distributed checkpoint smoke is the write/read authorization probe.
@@ -294,8 +332,11 @@ Sunfish intentionally contains no allocation creation or mutation command.
 Every pod command goes through `scripts/launch_tpu_pod.sh`. It uses
 the guarded `scripts/tpu_iap.sh` wrapper, which expands to `gcloud alpha
 compute tpus tpu-vm ssh ... --worker=all --batch-size=all
---tunnel-through-iap`. It gives every host one run ID/config/command, records
-the exact remote command, and keeps a separate host log and `pip freeze`.
+--tunnel-through-iap`. SSH centrally sets `ServerAliveInterval=30`,
+`ServerAliveCountMax=6`, and `TCPKeepAlive=yes`, so a dead tunnel is detected
+instead of hanging indefinitely. It gives every host one run ID/config/command,
+records the exact remote command, and keeps a separate host log and `pip
+freeze`.
 Config and release transfers use the matching all-worker IAP SCP form. The
 wrapper has no TPU lifecycle subcommand and rejects remote power/lifecycle
 commands before invoking `gcloud`.
@@ -303,8 +344,68 @@ commands before invoking `gcloud`.
 rejects any worker whose commit or source-tree digest differs from the
 controller. It separately hashes the selected config bytes on the controller
 and every worker, so rendered configs outside Git receive the same protection.
+It also requires `XLA_PYTHON_CLIENT_PREALLOCATE` to be an explicit lowercase
+boolean and forwards that value as a validated entrypoint argument; the worker
+exports it before any JAX-bearing command starts. The checked-in `job.env`
+example selects `false`.
+Before spawning any workload, the exported host entrypoint performs a
+dependency-free, read-only `/proc` hygiene check. It fails if another
+current-user PID holds `/dev/accel*`, or if `/tmp/libtpu_lockfile` exists
+without a verified current-run/attempt current-user fd owner. It reports PID,
+device, and command hashes but never signals a process or removes a lockfile.
+Either condition is an allocation-owner-intervention stop: do not retry JAX
+initialization until the owner confirms the holder/lock state is safe.
 The verified source identity is exported to the launched process and embedded
 in every run and readiness artifact.
+
+The worker command intentionally remains attached to SSH. Do not add `nohup`,
+`setsid`, a background ampersand, or a detached supervisor without a separately
+reviewed status/log/reattach protocol. On an abnormal launcher or tunnel exit,
+the controller runs the exact run/attempt PID interrupter with a 120-second
+bound, then terminates the isolated local gcloud process group; a failed remote
+cleanup returns the non-retryable status 126 and is a hard stop before any
+retry. Gate 7 resumes only when the intentionally interrupted first launch
+reports signal-style status 137 or 143; status 126, zero, or any unrelated
+nonzero status cannot serve as interruption evidence. If either exact remote
+cleanup or controller-local process-group cleanup is unproven on an exception
+or controller signal, `sunfish-preemption-gate` itself exits 126.
+
+The host entrypoint starts a stock-Python, no-fork publication waiter and
+exclusively records that PID before releasing it to `exec` the real workload.
+The recorded PID therefore becomes the actual `sunfish-train` PID, while a
+raced PID-file object cannot start a workload or descendant. If the blocked
+pre-exec child cannot be stopped exactly, the entrypoint exits 126 and forbids
+retry.
+
+Every calibration, reconstruction, router, and recovery attempt expected to
+run longer than the operator's terminal session must use the durable controller
+contract. Start a named tmux session on a powered, sleep-disabled controller
+with a stable network path, make the two acknowledgements only after those
+conditions are true, and precommit a finite retry budget:
+
+```bash
+tmux new-session -s sunfish-production
+export SUNFISH_CONTROLLER_STAYS_AWAKE_ACK=1
+export SUNFISH_CONTROLLER_NETWORK_STABLE_ACK=1
+
+scripts/launch_tpu_pod.sh \
+  --run-id "$PRODUCTION_RUN_ID" \
+  --attempt-id "$PRODUCTION_RUN_ID-001" \
+  --config "$PRODUCTION_LOCAL_CONFIG" \
+  --remote-config "$PRODUCTION_REMOTE_CONFIG" \
+  --require-durable-controller \
+  --attempt-number 1 \
+  --max-attempts 3 \
+  -- \
+  .venv-tpu/bin/sunfish-train --config "$PRODUCTION_REMOTE_CONFIG"
+```
+
+The launcher verifies the active tmux session, both acknowledgements, and
+`attempt_number <= max_attempts`, then records the contract beside the
+controller log. A retry increments both the attempt ID and attempt number; do
+not silently extend the budget. Tmux preserves the controller shell and logs
+when the UI terminal disconnects; it does not make controller power or network
+loss harmless, which is why Gate 7 and exact cleanup remain mandatory.
 
 Never invoke `python -m kauldron.main` directly: that module calls
 `jax.devices()` at import. `sunfish-train` and `sunfish-kauldron` initialize
@@ -458,11 +559,24 @@ comparison below; a synthetic state cannot substitute for either.
 ### 6. Real-model exact resume
 
 The rendered `sunfish-resume-smoke.toml` has the identical dataset, seed,
-model, and topology but its own empty workdir. The diagnostic checkpoints after one real
-update, runs the next update uninterrupted, rebuilds the production trainer
-and Grain iterator, restores, then compares the next batch, loss, trainable
-gradients/updates/parameters, full optimizer/collections/step, and frozen-base
-invariance exactly on every addressable shard.
+model, and topology but its own empty workdir. The diagnostic orchestrates two
+sequential Python processes on every host. The first checkpoints after one real
+update, records the next uninterrupted update, closes its Orbax manager, and
+exits. Only then does the second process initialize distributed JAX, rebuild
+the production trainer/manager and Grain iterator, discover and restore step 1,
+then compare the next batch, loss, trainable gradients/updates/parameters, full
+optimizer/collections/step, and frozen-base invariance exactly on every
+addressable shard. Distinct cryptographic process tokens and the immutable
+first-process summary are embedded in the final evidence. The readiness merger
+recomputes that summary from its host records, reconstructs its exact hash, and
+binds every control digest and launcher attempt across the process boundary.
+The evidence prefix must be a shared `gs://bucket/prefix`; worker-local paths
+are rejected before distributed JAX initialization. A bounded all-host error
+broadcast turns any process-0 merge or immutable-write failure into the same
+nonzero exit on every worker instead of leaving peers at a later collective.
+The outer orchestrator latches TERM/HUP/INT before spawning each phase,
+forwards it to the exact child, and applies bounded TERM/KILL cleanup; a
+shutdown request can never advance from prepare into resume.
 
 ```bash
 scripts/launch_tpu_pod.sh \
@@ -485,8 +599,12 @@ scripts/launch_tpu_pod.sh \
 The rendered `sunfish-preemption-smoke.toml` has the same
 model/data/seed/topology but its own fresh run ID and empty workdir. The
 controller waits for Orbax's pinned
-`commit_success.txt` marker, sends SIGKILL only to the exact recorded training
-processes on every worker,
+`commit_success.txt` marker, snapshots the published `sunfish-train` roots and
+every transitive current-user descendant before the first signal, verifies
+their exact run/attempt environment, command hash, PID, parent PID, and Linux
+start time, then sends SIGKILL to only those individual records through
+pidfds. It never signals a process group. It then waits a bounded interval and
+fails if any same-run/attempt process remains,
 proves the finalized checkpoint survived, and relaunches the unchanged config.
 No GCS deletion or cursor editing is permitted. The resumed attempt must emit
 its first process-0 metric at the checkpoint step (Kauldron's step-label
@@ -494,11 +612,23 @@ convention) and must not emit step 0; that metric's run/config/data/seed/source
 lineage is embedded in the gate evidence. This distinguishes a real restore
 from a silent full retrain that merely reaches the same final checkpoint.
 
-This gate never interrupts a TPU VM or allocation. The process helper verifies
-the PID belongs to the current worker user, the command line is exactly a
-`sunfish-train` entry point, and the run/attempt IDs match its
-`/proc/.../environ` before signaling it. All transport still passes through
-the lifecycle-blocking IAP wrapper.
+This gate never interrupts a TPU VM or allocation. If a descendant lacks the
+exact identity, or a new process appears after the immutable snapshot, the
+helper signals nothing unrecorded, reports owner intervention required, and
+forbids automated retry. All transport still passes through the
+lifecycle-blocking IAP wrapper. The controller bounds every interrupt call
+and owns the launcher in a separate local process group, so abnormal cleanup
+cannot orphan its gcloud/SSH pipeline. Worker logging also stops on an explicit
+regular-file marker rather than FIFO EOF, preventing inherited Grain stdout
+descriptors from hanging the all-host launcher.
+The Gate-7 orchestrator installs TERM/HUP/INT handling before either launcher
+spawn. A signal inside the `Popen` window is latched until the new process
+object exists, then exact remote cleanup and bounded local-group teardown run
+with repeated signals masked; the isolated launcher cannot escape as an
+unowned child.
+Each host publishes its direct-child PID with exclusive no-clobber creation;
+if publication loses a file/symlink race, it refuses replacement and performs
+bounded TERM/KILL/reap of only that unpublished direct child before failing.
 
 ```bash
 export SUNFISH_REMOTE_CONFIG="$PREEMPT_REMOTE_CONFIG"
@@ -514,8 +644,18 @@ export SUNFISH_REMOTE_CONFIG="$PREEMPT_REMOTE_CONFIG"
 
 Use the gate-4 smoke summary only after gates 5-7 pass. Gate 8 requires the
 steady-state p95 ratio of maximum host input wait to accelerator step time to
-be at most 10%, with zero local cache bytes. The gate-2 range-read baseline is
-diagnostic context and cannot pass gate 8 by itself.
+be at most 10%, with zero persistent/local-disk cache bytes. The production
+path still performs direct per-record GCS range reads. Its only overlap is the
+explicit bounded Grain multiprocessing queue: exactly two already-batched
+items per worker, recorded in Gate-8 evidence. This in-memory buffer is not a
+dataset cache. The gate-2 range-read baseline is diagnostic context and cannot
+pass gate 8 by itself; if the real slice misses the threshold, stop and measure
+before changing the cache or file-handle policy.
+
+Gate 4 also records `bytes_in_use`, `peak_bytes_in_use`, and `bytes_limit` from
+`memory_stats()` for every local TPU device on every evidence step. Missing or
+inconsistent device snapshots fail the gate, as does any peak HBM fraction
+above the precommitted 90% ceiling.
 
 Finally merge every immutable artifact into the only Stage-0.5 go/no-go:
 
@@ -554,6 +694,9 @@ real resume gates.
 - Clean training-process exit waits for async finalization. Abrupt process
   interruption loses only
   work after the last finalized checkpoint; restart restores automatically.
+- Manager construction removes only Orbax temporary checkpoint directories
+  left by an interrupted asynchronous save. Finalized checkpoints are never
+  selected by that cleanup path, and operators must not delete GCS state.
 - No multi-hour job starts before the real exact-resume comparison passes.
 
 See `docs/training_harness.md` for phase masks, prefix-amortized multi-noise

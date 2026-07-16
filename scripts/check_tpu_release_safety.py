@@ -19,6 +19,7 @@ WORKER_SCRIPTS = (
     SCRIPTS / "probe_tpu_worker_base.sh",
     SCRIPTS / "tpu_host_entrypoint.sh",
     SCRIPTS / "upload_tpu_configs.sh",
+    SCRIPTS / "verify_tpu_bundled_runtime.sh",
 )
 MUTATING_TPU_VM_COMMANDS = (
     "attach-disk",
@@ -49,6 +50,8 @@ def main() -> int:
         "--worker=all",
         "--batch-size=all",
         "--tunnel-through-iap",
+        "--ssh-flag=-oServerAliveInterval=30",
+        "--ssh-flag=-oServerAliveCountMax=6",
     ):
         if token not in wrapper:
             fail(f"IAP transport wrapper is missing {token!r}")
@@ -73,6 +76,9 @@ def main() -> int:
         "offline-requirements.lock",
         "sunfish_tpu.offline_bundle verify",
         "sunfish_tpu.offline_bundle verify-installed",
+        "sunfish_tpu.standalone_runtime verify-installed",
+        "--require-worker-runtime",
+        "python/bin/python3",
     ):
         if required not in bootstrap:
             fail(f"offline worker bootstrap is missing {required!r}")
@@ -82,6 +88,58 @@ def main() -> int:
     )
     if "export SUNFISH_TPU_WORKER=1" not in host_entrypoint:
         fail("all-worker entrypoint does not mark the TPU worker environment")
+    for proxy_name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        if proxy_name not in host_entrypoint:
+            fail(f"all-worker entrypoint does not reject {proxy_name}")
+    launcher = (SCRIPTS / "launch_tpu_pod.sh").read_text(encoding="utf-8")
+    for text, name in (
+        (launcher, "controller launcher"),
+        (host_entrypoint, "all-worker entrypoint"),
+    ):
+        if "XLA_PYTHON_CLIENT_PREALLOCATE" not in text:
+            fail(f"{name} does not bind XLA preallocation policy")
+    if "--xla-python-client-preallocate" not in launcher:
+        fail("controller launcher does not forward XLA preallocation policy")
+    for required in (
+        "controller_attached_launch.py",
+        "interrupt_training_attempt.sh",
+        "require_durable_controller.sh",
+    ):
+        if required not in launcher:
+            fail(f"controller launcher is missing lifetime guard {required!r}")
+    for required in (
+        "publish_pid_file",
+        "set -o noclobber",
+        "stop_unpublished_child",
+        "pid_publish_gate.py",
+        "exit 126",
+    ):
+        if required not in host_entrypoint:
+            fail(f"all-worker entrypoint lacks exact PID publication guard {required!r}")
+    if "sunfish_tpu.worker_hygiene" not in host_entrypoint:
+        fail("all-worker entrypoint lacks the read-only accelerator/lock hygiene gate")
+    exact_interrupt = (
+        ROOT / "src/sunfish_tpu/exact_process_interrupt.py"
+    ).read_text(encoding="utf-8")
+    for required in (
+        "pidfd_send_signal",
+        "start_time_ticks",
+        "exact_recorded_descendants",
+        "owner intervention is required",
+    ):
+        if required not in exact_interrupt:
+            fail(f"Gate-7 exact process helper is missing {required!r}")
+    if "killpg" in exact_interrupt:
+        fail("Gate-7 worker helper may not signal a process group")
+    hygiene = (ROOT / "src/sunfish_tpu/worker_hygiene.py").read_text(
+        encoding="utf-8"
+    )
+    for required in ("/dev/accel", "/tmp/libtpu_lockfile", "read_only"):
+        if required not in hygiene:
+            fail(f"worker hygiene check is missing {required!r}")
+    for forbidden in ("os.kill(", ".unlink(", "shutil.rmtree"):
+        if forbidden in hygiene:
+            fail(f"worker hygiene check is not read-only: {forbidden!r}")
     connected_only = (
         SCRIPTS / "build_tpu_offline_bundle.sh",
         SCRIPTS / "bootstrap_seed_cpu.sh",
@@ -99,6 +157,33 @@ def main() -> int:
         or probe.index("preflight_tpu_controller.sh") > probe.index("tpu_iap.sh")
     ):
         fail("base-image probe does not run controller preflight before TPU contact")
+    for proxy_name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        if proxy_name not in probe:
+            fail(f"base-image probe does not reject {proxy_name}")
+    if "SUNFISH_STOCK_PYTHON_BIN:-python3" not in probe:
+        fail("base-image probe does not use stock Python 3")
+    if "ensurepip" in probe or 'sys.version_info[:2]==(3,12)' in probe:
+        fail("base-image probe still assumes the bundled Python runtime")
+    deploy = (SCRIPTS / "deploy_tpu_offline_bundle.sh").read_text(encoding="utf-8")
+    for required in (
+        "SUNFISH_STOCK_PYTHON_BIN:-python3",
+        "standalone_runtime.py",
+        "extract-bundle",
+        "verify_tpu_bundled_runtime.sh",
+    ):
+        if required not in deploy:
+            fail(f"offline bundle deployment is missing {required!r}")
+    runtime_source = (
+        ROOT / "src/sunfish_tpu/standalone_runtime.py"
+    ).read_text(encoding="utf-8")
+    for exact_pin in (
+        'RUNTIME_RELEASE = "20260623"',
+        'RUNTIME_PYTHON_VERSION = "3.12.13"',
+        "9fa869d69be54f6b8eeae64272fbd9bb0646e0e1a8da9d80e51ba5a3bee48930",
+        "RUNTIME_ARCHIVE_SIZE = 111_146_559",
+    ):
+        if exact_pin not in runtime_source:
+            fail(f"standalone Python helper is missing exact pin {exact_pin!r}")
 
     implementation_files = [
         *SCRIPTS.glob("*.sh"),

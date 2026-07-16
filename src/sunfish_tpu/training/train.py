@@ -5,11 +5,28 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import stat
 from collections.abc import Sequence
 from pathlib import Path
 
 from sunfish_tpu import kauldron_launch
 from sunfish_tpu.training.spec import HarnessConfig
+
+
+def _packaged_kauldron_config_path() -> Path:
+    """Return the wheel-installed Kauldron config, refusing non-files."""
+    config_path = Path(__file__).resolve().with_name("kauldron_config.py")
+    try:
+        mode = config_path.lstat().st_mode
+    except OSError as error:
+        raise FileNotFoundError(
+            f"packaged Kauldron config is missing: {config_path}"
+        ) from error
+    if not stat.S_ISREG(mode):
+        raise RuntimeError(
+            f"packaged Kauldron config is not a regular file: {config_path}"
+        )
+    return config_path
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -30,6 +47,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     config_path = Path(args.config).resolve()
     config = HarnessConfig.load(config_path)
+    config_module = _packaged_kauldron_config_path()
     summary = {
         "ready_for_runtime_validation": True,
         "config": str(config_path),
@@ -52,9 +70,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
 
     os.environ["SUNFISH_TRAIN_CONFIG"] = str(config_path)
-    config_module = (
-        Path(__file__).resolve().parents[3] / "configs/training/sunfish.py"
-    )
     allow_non_tpu = args.allow_non_tpu or not config.topology.require_tpu
     os.environ["SUNFISH_ALLOW_NON_TPU"] = "1" if allow_non_tpu else "0"
     expected_devices = 0 if allow_non_tpu else config.topology.expected_devices

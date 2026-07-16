@@ -305,3 +305,29 @@ Local verification is **229 tests green with 21 intentional heavy-stack
 skips**, 21 CLI help checks, five strict TOMLs, all 13 shell scripts, static
 release safety, bytecode, notebook JSON, executable bits, and `git diff
 --check` green. Hardware readiness remains 0/8; no TPU or bucket was touched.
+
+**Final readiness repair closure (Codex, 2026-07-16):** Chase's imminent-run
+review found and repaired additional fail-closed gaps before any cloud access:
+installed-wheel Kauldron config discovery; a true fresh-process Gate 6 restart;
+exact Gate 7 PID publication, descendant interruption, and non-retryable
+cleanup status; a hash-bound standalone CPython 3.12.13 worker runtime; durable
+controller and bounded host-log lifetimes; topology-derived smoke configs;
+trainable-only gradient telemetry, Gemma rematerialization, and measured HBM
+gates; Orbax temporary-directory cleanup; exact 75M-token Stage-1 corpus and
+teacher inventories; end-to-end generation/size/CRC32C/SHA provenance; and a
+single-read expert-selection snapshot that closes the seed materialization
+TOCTOU boundary. The stable local tree passes **343 tests with 25 intentional
+heavy-stack skips**, all 22 CLI help checks, five strict training TOMLs, all 15
+shell launchers, 35 checks against the pinned Kauldron/Orbax/Gemma source
+archives, release-safety policy, bytecode compilation, notebook JSON parsing,
+and `git diff --check`.
+
+This closure is local evidence only. No TPU, bucket, deployment, or other cloud
+state was touched, and hardware readiness remains **0/8**. Before training, the
+reviewed source must be committed and frozen; a connected Linux x86_64 host
+must build the immutable offline release; source-bound Stage-0 P1-P5 and the
+high-memory Orbax seed materialization must run; owner-supplied allocation,
+IAP, IAM, bucket, and topology facts must replace the job template; the exact
+reviewed Stage-1 corpus receipt must exist; and the ordered eight-gate ledger
+must pass on the actual slice. Until then the production training launch is a
+no-go.

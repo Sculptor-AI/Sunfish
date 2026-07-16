@@ -30,6 +30,11 @@ _TOKEN_BYTES = 4
 _INPUT_WAIT_LOCK = threading.Lock()
 _INPUT_WAIT_SAMPLES: list[float] = []
 
+# Kauldron batches before applying Grain multiprocessing prefetch.  Keep this
+# small and explicit: it overlaps direct GCS range-read latency without adding
+# a persistent/local-disk cache or an unbounded host-memory queue.
+GRAIN_PREFETCH_BATCHES_PER_WORKER = 2
+
 
 def consume_input_wait_metrics() -> dict[str, float | int]:
     """Return and reset main-process iterator wait samples since last log."""
@@ -48,6 +53,16 @@ def consume_input_wait_metrics() -> dict[str, float | int]:
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class TimedPyGrainIterator(kd_iterators.PyGrainIterator):
     """Checkpoint-compatible PyGrain iterator with main-process wait timing."""
+
+    def __kd_ocp_restore_post__(self, value: grain.DatasetIterator):
+        """Preserve wait instrumentation across Kauldron's Orbax restore hook."""
+        restored = super().__kd_ocp_restore_post__(value)
+        if not isinstance(restored, kd_iterators.PyGrainIterator):
+            raise TypeError(
+                "Kauldron PyGrain restore returned "
+                f"{type(restored)!r}, expected PyGrainIterator"
+            )
+        return type(self)(source=restored.source, iter=restored.iter)
 
     def __next__(self):
         started = time.perf_counter()

@@ -10,6 +10,8 @@ from sunfish_tpu.orbax_seed import (
     classify_prunable_path,
     require_parameter_count,
     audited_target_text_parameters,
+    load_selection_snapshot,
+    require_unchanged_source_inventory,
     validate_prunable_inventory,
 )
 
@@ -88,6 +90,50 @@ class OrbaxSeedContractTests(unittest.TestCase):
             audited_target_text_parameters(48),
             AUDITED_TARGET_TEXT_PARAMETERS_32E,
         )
+
+    def test_selection_snapshot_reads_bytes_exactly_once(self):
+        first = json.dumps(
+            {
+                "schema_version": 1,
+                "purpose": "stage-0.5-infrastructure-readiness-only",
+                "promotion_allowed": False,
+                "selection_method": "first-32",
+                "source_experts": 128,
+                "retained_experts": 32,
+                "top_k_experts": 4,
+                "layers": {
+                    str(layer): list(range(32)) for layer in range(30)
+                },
+            }
+        ).encode()
+        changed = first.replace(b'"top_k_experts": 4', b'"top_k_experts": 8')
+
+        class MutatingPath:
+            calls = 0
+
+            def read_bytes(self):
+                self.calls += 1
+                return first if self.calls == 1 else changed
+
+            def __str__(self):
+                return "mutating-selection.json"
+
+        path = MutatingPath()
+        snapshot = load_selection_snapshot(
+            path,  # type: ignore[arg-type]
+            source_experts=128,
+            retained_experts=32,
+            top_k_experts=4,
+        )
+        self.assertEqual(path.calls, 1)
+        self.assertEqual(snapshot.layers[0], tuple(range(32)))
+
+    def test_source_inventory_must_be_unchanged_across_load(self):
+        inventory = {"sha256": "a" * 64, "objects": [{"generation": 1}]}
+        require_unchanged_source_inventory(inventory, dict(inventory))
+        changed = {"sha256": "b" * 64, "objects": [{"generation": 2}]}
+        with self.assertRaisesRegex(RuntimeError, "changed while loading"):
+            require_unchanged_source_inventory(inventory, changed)
 
 
 if __name__ == "__main__":

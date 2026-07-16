@@ -76,6 +76,13 @@ def _render_one(
             _toml_string(f"{storage_root}/data/tiny-overfit-{run_tag}"),
         ),
         ("data", "manifest_sha256", _toml_string(dataset_manifest_sha256)),
+        # Readiness is deliberately one example per global JAX device.  The
+        # reviewed templates target v4-64 (32 devices), but the renderer also
+        # accepts a smaller measured grant.  Carrying the template's batch of
+        # 32 into a 16-device v4-32 slice would double every per-device
+        # activation estimate and can turn the HBM smoke into an avoidable
+        # OOM before it measures anything useful.
+        ("data", "global_batch_size", str(expected_devices)),
         (
             "checkpoint",
             "init_path",
@@ -204,6 +211,7 @@ def render_stage05_configs(
             "processes": expected_processes,
             "local_devices": expected_local_devices,
         },
+        "readiness_global_batch_size": expected_devices,
         "templates": template_hashes,
         "sunfish_source": source_identity,
         "configs": {
@@ -311,6 +319,15 @@ def validate_rendered_config_file(
         )
     }:
         raise ValueError("rendered config bundle topology differs")
+    global_batch_sizes = {
+        config.data.global_batch_size for config in loaded.values()
+    }
+    if global_batch_sizes != {payload.get("readiness_global_batch_size")}:
+        raise ValueError("rendered config bundle readiness batch differs")
+    if global_batch_sizes != {expected_topology.get("global_devices")}:
+        raise ValueError(
+            "rendered readiness batch must be one example per global device"
+        )
     parity_pin = payload.get("stage0_parity")
     if not isinstance(parity_pin, Mapping):
         raise ValueError("rendered config bundle has no Stage-0 parity pin")

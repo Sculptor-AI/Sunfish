@@ -48,6 +48,22 @@ def wait(step, process, seconds=0.01, *, attempt="a1"):
         },
         "local_cache_policy": "none-direct-gcs-range-reads",
         "local_cache_bytes": 0,
+        "memory_prefetch_policy": "grain-mp-prefetch-bounded",
+        "per_worker_prefetch_batches": 2,
+        "device_memory": {
+            "schema_version": 1,
+            "purpose": "cloud-tpu-device-memory-snapshot",
+            "devices": [
+                {
+                    "local_device_index": 0,
+                    "device_id": process,
+                    "platform": "tpu",
+                    "bytes_in_use": 40,
+                    "peak_bytes_in_use": 50,
+                    "bytes_limit": 100,
+                }
+            ],
+        },
     }
 
 
@@ -92,6 +108,97 @@ class SmokeEvidenceTests(unittest.TestCase):
         )
         self.assertFalse(result["gates"]["8"]["passed"])
         self.assertTrue(any("hosts" in error for error in result["errors"]))
+
+    def test_unbounded_or_changed_prefetch_contract_fails_gate8_only(self):
+        metrics = [metric(step, 2.0 - 0.02 * step) for step in range(20)]
+        waits = [wait(step, process) for step in range(20) for process in range(2)]
+        waits[10]["per_worker_prefetch_batches"] = 3
+        result = analyze_smoke_evidence(
+            metrics,
+            waits,
+            expected_processes=2,
+            min_steps=20,
+            steady_state_start=5,
+        )
+        self.assertTrue(result["gates"]["4"]["passed"])
+        self.assertFalse(result["gates"]["8"]["passed"])
+        self.assertTrue(any("prefetch bound" in error for error in result["errors"]))
+
+    def test_missing_or_excessive_hbm_fails_gate4_only(self):
+        metrics = [metric(step, 2.0 - 0.02 * step) for step in range(20)]
+        waits = [wait(step, process) for step in range(20) for process in range(2)]
+        waits[0].pop("device_memory")
+        waits[1]["device_memory"]["devices"][0]["peak_bytes_in_use"] = 91
+        result = analyze_smoke_evidence(
+            metrics,
+            waits,
+            expected_processes=2,
+            min_steps=20,
+            steady_state_start=5,
+        )
+        self.assertFalse(result["gates"]["4"]["passed"])
+        self.assertTrue(result["gates"]["8"]["passed"])
+        self.assertTrue(any("HBM" in error for error in result["errors"]))
+
+    def test_hbm_device_identity_and_limit_must_be_stable(self):
+        metrics = [metric(step, 2.0 - 0.02 * step) for step in range(20)]
+        waits = [wait(step, process) for step in range(20) for process in range(2)]
+        waits[20]["device_memory"]["devices"][0]["device_id"] = 99
+        waits[21]["device_memory"]["devices"][0]["bytes_limit"] = 101
+        result = analyze_smoke_evidence(
+            metrics,
+            waits,
+            expected_processes=2,
+            min_steps=20,
+            steady_state_start=5,
+        )
+        self.assertFalse(result["gates"]["4"]["passed"])
+        self.assertTrue(result["gates"]["8"]["passed"])
+        self.assertTrue(any("differs from baseline" in error for error in result["errors"]))
+
+    def test_hbm_device_ids_must_be_globally_disjoint(self):
+        metrics = [metric(step, 2.0 - 0.02 * step) for step in range(20)]
+        waits = [wait(step, process) for step in range(20) for process in range(2)]
+        waits[1]["device_memory"]["devices"][0]["device_id"] = 0
+        result = analyze_smoke_evidence(
+            metrics,
+            waits,
+            expected_processes=2,
+            min_steps=20,
+            steady_state_start=5,
+        )
+        self.assertFalse(result["gates"]["4"]["passed"])
+        self.assertTrue(result["gates"]["8"]["passed"])
+        self.assertTrue(any("duplicated" in error for error in result["errors"]))
+
+    def test_hbm_peak_must_be_monotonic(self):
+        metrics = [metric(step, 2.0 - 0.02 * step) for step in range(20)]
+        waits = [wait(step, process) for step in range(20) for process in range(2)]
+        waits[20]["device_memory"]["devices"][0]["peak_bytes_in_use"] = 49
+        result = analyze_smoke_evidence(
+            metrics,
+            waits,
+            expected_processes=2,
+            min_steps=20,
+            steady_state_start=5,
+        )
+        self.assertFalse(result["gates"]["4"]["passed"])
+        self.assertTrue(result["gates"]["8"]["passed"])
+        self.assertTrue(any("peak HBM decreased" in error for error in result["errors"]))
+
+    def test_fresh_smoke_must_start_at_step_zero(self):
+        metrics = [metric(step, 2.0 - 0.02 * offset) for offset, step in enumerate(range(20, 40))]
+        waits = [wait(step, process) for step in range(20, 40) for process in range(2)]
+        result = analyze_smoke_evidence(
+            metrics,
+            waits,
+            expected_processes=2,
+            min_steps=20,
+            steady_state_start=25,
+        )
+        self.assertFalse(result["gates"]["4"]["passed"])
+        self.assertTrue(result["gates"]["8"]["passed"])
+        self.assertTrue(any("expected 0" in error for error in result["errors"]))
 
     def test_noncontiguous_or_nonfinite_metrics_fail(self):
         metrics = [metric(step, 1.0) for step in range(5)]

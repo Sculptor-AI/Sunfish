@@ -247,6 +247,7 @@ def verify_readiness_ledger(
             "real_resume",
             verify_real_resume_evidence(
                 evidence["real_resume"].get("hosts", ()),
+                prepare_summary=evidence["real_resume"].get("prepare_summary"),
                 expected_devices=expected_devices,
                 expected_processes=expected_processes,
                 expected_local_devices=expected_local_devices,
@@ -286,6 +287,10 @@ def verify_readiness_ledger(
         "local_devices": expected_local_devices,
     }:
         errors.append("rendered config bundle topology differs")
+    if bundle.get("readiness_global_batch_size") != expected_devices:
+        errors.append(
+            "rendered readiness batch is not one example per global device"
+        )
     parity_pin = bundle.get("stage0_parity")
     expected_parity_pin = (
         {
@@ -344,6 +349,12 @@ def verify_readiness_ledger(
             isinstance(smoke_gate4.get("max_update_norm"), (int, float))
             and math.isfinite(float(smoke_gate4.get("max_update_norm")))
             and float(smoke_gate4.get("max_update_norm")) > 0.0,
+            isinstance(smoke_gate4.get("max_peak_hbm_fraction"), (int, float))
+            and math.isfinite(float(smoke_gate4.get("max_peak_hbm_fraction")))
+            and float(smoke_gate4.get("max_peak_hbm_fraction")) <= 0.90,
+            smoke_gate4.get("max_allowed_peak_hbm_fraction") == 0.90,
+            isinstance(smoke_gate4.get("local_device_count"), int)
+            and smoke_gate4.get("local_device_count") > 0,
         )
     )
     smoke_lineage_ok = all(
@@ -368,7 +379,7 @@ def verify_readiness_ledger(
         and smoke_gate4.get("passed") is True
         and smoke_gate4_contract_ok,
         "smoke",
-        "real 100-500-step tiny-dataset overfit with nonzero updates",
+        "real 100-500-step tiny-dataset overfit, nonzero updates, and peak HBM at most 90%",
     )
 
     checkpoint = evidence["checkpoint"]
@@ -383,8 +394,12 @@ def verify_readiness_ledger(
     real_resume = evidence["real_resume"]
     resume_ok = (
         real_resume.get("passed") is True
+        and real_resume.get("schema_version") == 2
         and real_resume.get("gate") == 6
         and real_resume.get("scope") == "production-model-optimizer-grain-orbax"
+        and real_resume.get("restart_mode") == "separate-python-processes"
+        and isinstance(real_resume.get("prepare_summary"), Mapping)
+        and real_resume["prepare_summary"].get("passed") is True
         and len(real_resume.get("hosts", ())) == expected_processes
     )
     gate(6, resume_ok, "real_resume", "production next-step exact restart")
@@ -399,14 +414,24 @@ def verify_readiness_ledger(
             preemption.get("automatic_same_workdir_restore") is True,
             preemption.get("resume_continued_from_checkpoint") is True,
             preemption.get("fresh_start_metric_absent") is True,
+            preemption.get("exact_recorded_processes_interrupted") is True,
+            preemption.get("interrupt_process_policy")
+            == "pre-signal-exact-root-and-descendant-snapshot-with-pidfd",
+            preemption.get("preempted_launch_exit_policy")
+            == "signal-status-only-137-or-143",
+            preemption.get("same_attempt_descendants_absent") is True,
+            preemption.get("owner_intervention_required") is False,
+            preemption.get("interrupt_timeout_seconds") == 120,
             preemption.get("manual_gcs_cleanup_performed") is False,
             preemption.get("train_complete_found") is True,
             preemption.get("final_checkpoint_found") is True,
-            int(preemption.get("preempted_launch_returncode", 0)) != 0,
+            int(preemption.get("preempted_launch_returncode", 0)) in (137, 143),
             int(preemption.get("resumed_launch_returncode", -1)) == 0,
             _SHA256.fullmatch(str(preemption.get("resumed_output_sha256", "")))
             is not None,
             _SHA256.fullmatch(str(preemption.get("preempted_output_sha256", "")))
+            is not None,
+            _SHA256.fullmatch(str(preemption.get("interrupt_output_sha256", "")))
             is not None,
         )
     )
@@ -432,6 +457,9 @@ def verify_readiness_ledger(
             and float(max_p95_wait_ratio) <= 0.10,
             smoke_gate8.get("local_cache_policy")
             == "none-direct-gcs-range-reads",
+            smoke_gate8.get("memory_prefetch_policy")
+            == "grain-mp-prefetch-bounded",
+            smoke_gate8.get("per_worker_prefetch_batches") == 2,
         )
     )
     gate(
@@ -440,7 +468,7 @@ def verify_readiness_ledger(
         and smoke_gate8.get("passed") is True
         and smoke_gate8_contract_ok,
         "smoke",
-        "steady-state p95 input-wait ratio and zero local cache",
+        "steady-state p95 input-wait ratio, zero local-disk cache, and bounded memory prefetch",
     )
 
     if normalize_source_identity(

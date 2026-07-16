@@ -33,8 +33,20 @@ SOURCE_CONTRACTS: dict[str, tuple[str, str]] = {
         "orbax-checkpoint",
         "orbax/checkpoint/_src/path/atomicity_types.py",
     ),
+    "orbax_checkpoint_manager": (
+        "orbax-checkpoint",
+        "orbax/checkpoint/checkpoint_manager.py",
+    ),
+    "kauldron_checkpointer": (
+        "kauldron",
+        "kauldron/checkpoints/checkpointer.py",
+    ),
     "kauldron_train_loop": ("kauldron", "kauldron/train/train_loop.py"),
     "kauldron_data": ("kauldron", "kauldron/data/py/base.py"),
+    "kauldron_pygrain_iterator": (
+        "kauldron",
+        "kauldron/data/iterators/pygrain_handler.py",
+    ),
     "gemma_models": ("gemma", "gemma/diffusion/_models.py"),
     "gemma_paths": ("gemma", "gemma/diffusion/_paths.py"),
     "gemma_base_model": ("gemma", "gemma/gm/nn/gemma4/_gemma4.py"),
@@ -224,6 +236,60 @@ def audit_source_texts(
         marker == "commit_success.txt",
         repr(marker),
     )
+    checkpoint_manager_options = _find_class(
+        tree("orbax_checkpoint_manager"), "CheckpointManagerOptions"
+    )
+    cleanup_default = (
+        _literal_assignments(checkpoint_manager_options).get(
+            "cleanup_tmp_directories"
+        )
+        if checkpoint_manager_options is not None
+        else None
+    )
+    _add(
+        checks,
+        "orbax:temporary-directory-cleanup-option",
+        cleanup_default is False,
+        f"cleanup_tmp_directories={cleanup_default!r}",
+    )
+
+    kauldron_manager = _find_function(
+        tree("kauldron_checkpointer"),
+        "_ckpt_mgr",
+        class_name="Checkpointer",
+    )
+    manager_option_calls = (
+        _named_calls(kauldron_manager, "CheckpointManagerOptions")
+        if kauldron_manager is not None
+        else []
+    )
+    manager_keywords = (
+        {keyword.arg for keyword in manager_option_calls[0].keywords}
+        if len(manager_option_calls) == 1
+        else set()
+    )
+    expected_manager_keywords = {
+        "save_interval_steps",
+        "lightweight_initialize",
+        "max_to_keep",
+        "keep_time_interval",
+        "keep_period",
+        "save_on_steps",
+        "best_fn",
+        "best_mode",
+        "step_prefix",
+        "create",
+        "async_options",
+        "multiprocessing_options",
+        "preservation_policy",
+        "file_options",
+    }
+    _add(
+        checks,
+        "kauldron:checkpoint-manager-options-contract",
+        manager_keywords == expected_manager_keywords,
+        json.dumps(sorted(item for item in manager_keywords if item is not None)),
+    )
 
     train_tree = tree("kauldron_train_loop")
     composite_calls = _named_calls(train_tree, "checkpoint_state.CheckpointState")
@@ -290,6 +356,42 @@ def audit_source_texts(
         "ds[jax.process_index()::jax.process_count()]",
     )
 
+    pygrain_restore_post = _find_function(
+        tree("kauldron_pygrain_iterator"),
+        "__kd_ocp_restore_post__",
+        class_name="PyGrainIterator",
+    )
+    pygrain_signature = (
+        _function_signature(pygrain_restore_post)
+        if pygrain_restore_post is not None
+        else {}
+    )
+    pygrain_constructor_calls = (
+        _named_calls(pygrain_restore_post, "PyGrainIterator")
+        if pygrain_restore_post is not None
+        else []
+    )
+    pygrain_rewraps = any(
+        {
+            keyword.arg: ast.unparse(keyword.value)
+            for keyword in call.keywords
+            if keyword.arg is not None
+        }
+        == {"source": "self.source", "iter": "value"}
+        for call in pygrain_constructor_calls
+    )
+    _add(
+        checks,
+        "kauldron:pygrain-restore-post-contract",
+        pygrain_signature
+        == {"positional": ["self", "value"], "keyword_only": []}
+        and pygrain_rewraps,
+        json.dumps(
+            {"signature": pygrain_signature, "rewraps": pygrain_rewraps},
+            sort_keys=True,
+        ),
+    )
+
     diffusion_model = _find_class(tree("gemma_models"), "DiffusionGemma_26B_A4B")
     _add(
         checks,
@@ -352,6 +454,32 @@ def audit_source_texts(
         "gemma:hackable-network",
         hd_ok,
         "wrapper init_cache/encoder_call/__call__ plus prefill helper",
+    )
+
+    block_call = _find_function(
+        tree("gemma_modules"), "__call__", class_name="Block"
+    )
+    block_signature = (
+        _function_signature(block_call) if block_call is not None else {}
+    )
+    expected_block_signature = {
+        "positional": [
+            "self",
+            "x",
+            "segment_pos",
+            "cache",
+            "attn_mask",
+            "per_layer_input",
+            "kv_shared_cache",
+            "skip_sliding_mask",
+        ],
+        "keyword_only": [],
+    }
+    _add(
+        checks,
+        "gemma:block-rematerialization-boundary",
+        block_signature == expected_block_signature,
+        json.dumps(block_signature, sort_keys=True),
     )
 
     lora_tree = tree("gemma_hd_lora")

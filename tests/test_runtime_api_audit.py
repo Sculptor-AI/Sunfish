@@ -13,6 +13,31 @@ class StandardCheckpointer:
     pass
 """,
             "orbax_atomicity": "COMMIT_SUCCESS_FILE = 'commit_success.txt'\n",
+            "orbax_checkpoint_manager": """
+@dataclasses.dataclass
+class CheckpointManagerOptions:
+  cleanup_tmp_directories: bool = False
+""",
+            "kauldron_checkpointer": """
+class Checkpointer:
+  def _ckpt_mgr(self):
+    return ocp.CheckpointManagerOptions(
+        save_interval_steps=self.save_interval_steps,
+        lightweight_initialize=self.lightweight_initialize,
+        max_to_keep=self.max_to_keep,
+        keep_time_interval=self.keep_time_interval,
+        keep_period=self.keep_period,
+        save_on_steps=self.save_on_steps,
+        best_fn=None,
+        best_mode=self.best_mode,
+        step_prefix='ckpt',
+        create=self.create,
+        async_options=ocp.AsyncOptions(),
+        multiprocessing_options=self.multiprocessing_options,
+        preservation_policy=self.preservation_policy,
+        file_options=ocp.FileOptions(),
+    )
+""",
             "kauldron_train_loop": """
 def train_impl():
   state, chrono, ds_iter = ckpt.restore(
@@ -31,6 +56,11 @@ class DataSourceBase:
   def ds_for_current_process(self, rng):
     ds = ds[jax.process_index() :: jax.process_count()]
     return ds
+""",
+            "kauldron_pygrain_iterator": """
+class PyGrainIterator:
+  def __kd_ocp_restore_post__(self, value):
+    return PyGrainIterator(source=self.source, iter=value)
 """,
             "gemma_models": """
 class DiffusionGemma_26B_A4B(Base):
@@ -74,7 +104,15 @@ class MoERagged:
   def __call__(self, x, unnormalized_x=None): pass
 """,
             "gemma_layers": "class RMSNorm: pass\n",
-            "gemma_modules": "class FeedForward: pass\n",
+            "gemma_modules": """
+class FeedForward: pass
+class Block:
+  def __call__(
+      self, x, segment_pos, cache, attn_mask, per_layer_input=None,
+      kv_shared_cache=None, skip_sliding_mask=False,
+  ):
+    pass
+""",
         }
     )
     return sources
@@ -96,6 +134,58 @@ class RuntimeApiAuditTests(unittest.TestCase):
         self.assertFalse(report["passed"])
         failed = {check["name"] for check in report["checks"] if check["status"] == "fail"}
         self.assertIn("gemma:lora-private-apis", failed)
+
+    def test_pygrain_restore_hook_signature_drift_fails_closed(self):
+        sources = _passing_sources()
+        sources["kauldron_pygrain_iterator"] = sources[
+            "kauldron_pygrain_iterator"
+        ].replace("self, value", "self, value, extra")
+        report = audit_source_texts(sources)
+        self.assertFalse(report["passed"])
+        failed = {check["name"] for check in report["checks"] if check["status"] == "fail"}
+        self.assertIn("kauldron:pygrain-restore-post-contract", failed)
+
+    def test_kauldron_checkpoint_option_drift_fails_closed(self):
+        sources = _passing_sources()
+        sources["kauldron_checkpointer"] = sources[
+            "kauldron_checkpointer"
+        ].replace("        create=self.create,\n", "")
+        report = audit_source_texts(sources)
+        self.assertFalse(report["passed"])
+        failed = {
+            check["name"]
+            for check in report["checks"]
+            if check["status"] == "fail"
+        }
+        self.assertIn("kauldron:checkpoint-manager-options-contract", failed)
+
+    def test_orbax_cleanup_option_default_drift_fails_closed(self):
+        sources = _passing_sources()
+        sources["orbax_checkpoint_manager"] = sources[
+            "orbax_checkpoint_manager"
+        ].replace("= False", "= True")
+        report = audit_source_texts(sources)
+        self.assertFalse(report["passed"])
+        failed = {
+            check["name"]
+            for check in report["checks"]
+            if check["status"] == "fail"
+        }
+        self.assertIn("orbax:temporary-directory-cleanup-option", failed)
+
+    def test_gemma_rematerialization_boundary_drift_fails_closed(self):
+        sources = _passing_sources()
+        sources["gemma_modules"] = sources["gemma_modules"].replace(
+            "skip_sliding_mask=False", "new_static=False"
+        )
+        report = audit_source_texts(sources)
+        self.assertFalse(report["passed"])
+        failed = {
+            check["name"]
+            for check in report["checks"]
+            if check["status"] == "fail"
+        }
+        self.assertIn("gemma:block-rematerialization-boundary", failed)
 
     def test_missing_source_fails_closed(self):
         sources = _passing_sources()

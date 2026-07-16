@@ -2,13 +2,16 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: launch_tpu_pod.sh --run-id ID [--attempt-id ID] --config LOCAL_PATH [--remote-config REMOTE_PATH] -- command [args...]" >&2
+  echo "usage: launch_tpu_pod.sh --run-id ID [--attempt-id ID] --config LOCAL_PATH [--remote-config REMOTE_PATH] [--require-durable-controller --attempt-number N --max-attempts N] -- command [args...]" >&2
 }
 
 run_id=""
 attempt_id=""
 config=""
 remote_config=""
+require_durable_controller=false
+attempt_number=""
+max_attempts=""
 while (($#)); do
   case "$1" in
     --run-id)
@@ -25,6 +28,18 @@ while (($#)); do
       ;;
     --remote-config)
       remote_config="${2:-}"
+      shift 2
+      ;;
+    --require-durable-controller)
+      require_durable_controller=true
+      shift
+      ;;
+    --attempt-number)
+      attempt_number="${2:-}"
+      shift 2
+      ;;
+    --max-attempts)
+      max_attempts="${2:-}"
       shift 2
       ;;
     --)
@@ -56,6 +71,15 @@ fi
   echo "invalid --attempt-id" >&2
   exit 2
 }
+if [[ "${require_durable_controller}" == true ]]; then
+  [[ -n "${attempt_number}" && -n "${max_attempts}" ]] || {
+    echo "durable controller mode requires --attempt-number and --max-attempts" >&2
+    exit 2
+  }
+elif [[ -n "${attempt_number}" || -n "${max_attempts}" ]]; then
+  echo "attempt budgeting is valid only with --require-durable-controller" >&2
+  exit 2
+fi
 
 : "${TPU_NAME:?set TPU_NAME}"
 : "${PROJECT_ID:?set PROJECT_ID}"
@@ -63,6 +87,14 @@ fi
 : "${REMOTE_REPO_DIR:?set REMOTE_REPO_DIR to the absolute repo path on every worker}"
 : "${EXPECTED_TPU_DEVICES:?set EXPECTED_TPU_DEVICES}"
 : "${EXPECTED_TPU_PROCESSES:?set EXPECTED_TPU_PROCESSES}"
+: "${XLA_PYTHON_CLIENT_PREALLOCATE:?set XLA_PYTHON_CLIENT_PREALLOCATE to true or false}"
+case "${XLA_PYTHON_CLIENT_PREALLOCATE}" in
+  true|false) ;;
+  *)
+    echo "XLA_PYTHON_CLIENT_PREALLOCATE must be lowercase true or false" >&2
+    exit 2
+    ;;
+esac
 
 git_commit="$(git rev-parse HEAD)"
 [[ "${git_commit}" =~ ^[0-9a-f]{40}$ ]] || {
@@ -97,6 +129,7 @@ remote_command+=" --config $(quote_arg "${remote_config}")"
 remote_command+=" --config-sha256 $(quote_arg "${config_sha256}")"
 remote_command+=" --expected-devices $(quote_arg "${EXPECTED_TPU_DEVICES}")"
 remote_command+=" --expected-processes $(quote_arg "${EXPECTED_TPU_PROCESSES}")"
+remote_command+=" --xla-python-client-preallocate $(quote_arg "${XLA_PYTHON_CLIENT_PREALLOCATE}")"
 remote_command+=" --expected-commit $(quote_arg "${git_commit}")"
 remote_command+=" --source-tree-sha256 $(quote_arg "${source_tree_sha256}")"
 if [[ -n "${EXPECTED_LOCAL_TPU_DEVICES:-}" ]]; then
@@ -112,5 +145,16 @@ mkdir -p "${controller_log_dir}"
 printf '%s\n' "${remote_command}" > "${controller_log_dir}/remote-command.txt"
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-"${script_dir}/tpu_iap.sh" ssh-all --command "${remote_command}" \
-  2>&1 | tee "${controller_log_dir}/all-workers.log"
+if [[ "${require_durable_controller}" == true ]]; then
+  "${script_dir}/require_durable_controller.sh" \
+    --attempt-number "${attempt_number}" \
+    --max-attempts "${max_attempts}" \
+    > "${controller_log_dir}/durable-controller-contract.txt"
+fi
+"${controller_python}" "${script_dir}/controller_attached_launch.py" \
+  --log "${controller_log_dir}/all-workers.log" \
+  --cleanup-script "${script_dir}/interrupt_training_attempt.sh" \
+  --run-id "${run_id}" \
+  --attempt-id "${attempt_id}" \
+  -- \
+  "${script_dir}/tpu_iap.sh" ssh-all --command "${remote_command}"

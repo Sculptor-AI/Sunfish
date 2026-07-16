@@ -15,6 +15,7 @@ from sunfish_tpu.source_identity import normalize_source_identity
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_MAX_HBM_PEAK_FRACTION = 0.90
 
 
 def _evidence_lineage(payload: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -107,6 +108,10 @@ def analyze_smoke_evidence(
     steps = sorted(metrics_by_step)
     if len(steps) < min_steps:
         errors.append(f"only {len(steps)} metric steps found; require {min_steps}")
+    if steps and steps[0] != 0:
+        errors.append(
+            f"fresh tiny-overfit metric evidence starts at step {steps[0]}, expected 0"
+        )
     if steps and steps != list(range(steps[0], steps[-1] + 1)):
         errors.append("metric steps are not contiguous")
 
@@ -195,6 +200,135 @@ def analyze_smoke_evidence(
     ratios: list[float] = []
     analyzed_steps: list[int] = []
     expected_indices = set(range(expected_processes))
+    hbm_peak_fractions: list[float] = []
+    hbm_device_counts: set[int] = set()
+    hbm_baseline: dict[tuple[int, int], tuple[int, int]] | None = None
+    previous_hbm_peaks: dict[tuple[int, int], int] = {}
+    for step in steps:
+        hosts = waits_by_step.get(step, {})
+        if set(hosts) != expected_indices:
+            errors.append(
+                f"step {step} HBM evidence host set is {sorted(hosts)}, "
+                f"expected {sorted(expected_indices)}"
+            )
+            continue
+        step_devices: dict[tuple[int, int], tuple[int, int, int]] = {}
+        global_device_ids: dict[int, tuple[int, int]] = {}
+        complete_step = True
+        for process, payload in sorted(hosts.items()):
+            memory = payload.get("device_memory")
+            if not isinstance(memory, Mapping) or memory.get("schema_version") != 1:
+                errors.append(
+                    f"step {step} host {process} has missing/invalid HBM evidence"
+                )
+                complete_step = False
+                continue
+            if memory.get("purpose") != "cloud-tpu-device-memory-snapshot":
+                errors.append(f"step {step} host {process} changed the HBM policy")
+                complete_step = False
+                continue
+            devices = memory.get("devices")
+            if not isinstance(devices, list) or not devices:
+                errors.append(f"step {step} host {process} has no HBM device snapshots")
+                complete_step = False
+                continue
+            valid_devices = 0
+            device_ids = set()
+            for local_index, device in enumerate(devices):
+                if not isinstance(device, Mapping) or device.get(
+                    "local_device_index"
+                ) != local_index:
+                    errors.append(
+                        f"step {step} host {process} has invalid HBM device ordering"
+                    )
+                    complete_step = False
+                    continue
+                device_id = device.get("device_id")
+                if (
+                    isinstance(device_id, bool)
+                    or not isinstance(device_id, int)
+                    or device_id in device_ids
+                    or device.get("platform") != "tpu"
+                ):
+                    errors.append(
+                        f"step {step} host {process} has invalid TPU device identity"
+                    )
+                    complete_step = False
+                    continue
+                device_ids.add(device_id)
+                device_key = (process, local_index)
+                prior_owner = global_device_ids.get(device_id)
+                if prior_owner is not None and prior_owner != device_key:
+                    errors.append(
+                        f"step {step} TPU device ID {device_id} is duplicated by "
+                        f"hosts/local-indices {prior_owner} and {device_key}"
+                    )
+                    complete_step = False
+                else:
+                    global_device_ids[device_id] = device_key
+                values = []
+                for name in ("bytes_in_use", "peak_bytes_in_use", "bytes_limit"):
+                    value = device.get(name)
+                    if isinstance(value, bool) or not isinstance(value, int):
+                        errors.append(
+                            f"step {step} host {process} device {local_index} "
+                            f"has invalid HBM {name}"
+                        )
+                        complete_step = False
+                        break
+                    values.append(value)
+                else:
+                    bytes_in_use, peak_bytes, bytes_limit = values
+                    if not 0 <= bytes_in_use <= peak_bytes <= bytes_limit or bytes_limit <= 0:
+                        errors.append(
+                            f"step {step} host {process} device {local_index} "
+                            "has inconsistent HBM counters"
+                        )
+                        complete_step = False
+                        continue
+                    step_devices[device_key] = (device_id, bytes_limit, peak_bytes)
+                    fraction = peak_bytes / bytes_limit
+                    hbm_peak_fractions.append(fraction)
+                    valid_devices += 1
+                    if fraction > _MAX_HBM_PEAK_FRACTION:
+                        errors.append(
+                            f"step {step} host {process} device {local_index} "
+                            f"peak HBM fraction {fraction:.4f} exceeds "
+                            f"{_MAX_HBM_PEAK_FRACTION:.4f}"
+                        )
+            if valid_devices == len(devices):
+                hbm_device_counts.add(valid_devices)
+            else:
+                complete_step = False
+        if complete_step:
+            identity = {
+                key: (device_id, bytes_limit)
+                for key, (device_id, bytes_limit, _peak) in step_devices.items()
+            }
+            if hbm_baseline is None:
+                hbm_baseline = identity
+            elif identity != hbm_baseline:
+                errors.append(
+                    f"step {step} HBM device-ID/bytes-limit set differs from baseline"
+                )
+            if identity == hbm_baseline:
+                for key, (_device_id, _bytes_limit, peak_bytes) in step_devices.items():
+                    previous_peak = previous_hbm_peaks.get(key)
+                    if previous_peak is not None and peak_bytes < previous_peak:
+                        errors.append(
+                            f"step {step} host {key[0]} device {key[1]} peak HBM "
+                            f"decreased from {previous_peak} to {peak_bytes}"
+                        )
+                    previous_hbm_peaks[key] = max(
+                        peak_bytes, previous_peak if previous_peak is not None else 0
+                    )
+    if len(hbm_device_counts) != 1:
+        errors.append(
+            "HBM evidence does not report one consistent positive local-device count"
+        )
+    if hbm_baseline is None:
+        errors.append("HBM evidence has no complete device baseline")
+
     for step in steps:
         if step < steady_state_start or step not in wall_seconds:
             continue
@@ -216,7 +350,13 @@ def analyze_smoke_evidence(
                 errors.append(f"step {step} host {process} has invalid wait time")
                 continue
             if payload.get("local_cache_bytes") != 0:
-                errors.append(f"step {step} host {process} used unbounded local cache")
+                errors.append(f"step {step} host {process} used a local disk cache")
+            if payload.get("local_cache_policy") != "none-direct-gcs-range-reads":
+                errors.append(f"step {step} host {process} changed the direct-GCS policy")
+            if payload.get("memory_prefetch_policy") != "grain-mp-prefetch-bounded":
+                errors.append(f"step {step} host {process} changed the prefetch policy")
+            if payload.get("per_worker_prefetch_batches") != 2:
+                errors.append(f"step {step} host {process} changed the prefetch bound")
             host_waits.append(seconds)
         if len(host_waits) == expected_processes:
             ratios.append(max(host_waits) / wall_seconds[step])
@@ -234,7 +374,16 @@ def analyze_smoke_evidence(
     gate4_errors = [
         error
         for error in errors
-        if not any(token in error for token in ("input-wait", "hosts are", "local cache"))
+        if not any(
+            token in error
+            for token in (
+                "input-wait",
+                "hosts are",
+                "local disk cache",
+                "direct-GCS",
+                "prefetch",
+            )
+        )
         and "p95" not in error
         and "steady-state" not in error
     ]
@@ -256,6 +405,11 @@ def analyze_smoke_evidence(
                 "max_gradient_norm": max(gradient_norms, default=None),
                 "max_update_norm": max(update_norms, default=None),
                 "required_relative_loss_reduction": min_relative_loss_reduction,
+                "max_peak_hbm_fraction": max(hbm_peak_fractions, default=None),
+                "max_allowed_peak_hbm_fraction": _MAX_HBM_PEAK_FRACTION,
+                "local_device_count": (
+                    next(iter(hbm_device_counts)) if len(hbm_device_counts) == 1 else None
+                ),
             },
             "8": {
                 "passed": not gate8_errors,
@@ -264,6 +418,8 @@ def analyze_smoke_evidence(
                 "p95_input_wait_ratio": p95_wait_ratio,
                 "max_p95_input_wait_ratio": max_p95_input_wait_ratio,
                 "local_cache_policy": "none-direct-gcs-range-reads",
+                "memory_prefetch_policy": "grain-mp-prefetch-bounded",
+                "per_worker_prefetch_batches": 2,
             },
         },
         "errors": errors,

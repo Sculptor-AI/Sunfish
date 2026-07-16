@@ -15,6 +15,7 @@ import functools
 import hashlib
 import json
 import math
+import operator
 import os
 import re
 import sys
@@ -32,9 +33,20 @@ from sunfish_tpu.source_identity import (
     require_launcher_run_id,
     source_identity_from_environment,
 )
+from sunfish_tpu.stage1_contract import (
+    MASS_COVERAGE_32,
+    MASS_COVERAGE_48,
+    MIN_CALIBRATION_INPUT_TOKENS,
+    RECONSTRUCTION_SAMPLE_TOKENS,
+    validate_calibration_source_contract,
+)
+from sunfish_tpu.calibration_data_inventory import (
+    verify_live_calibration_data_inventory,
+)
 
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_GCS_REVISION = re.compile(r"^gcs-inventory-sha256:[0-9a-f]{64}$")
 _FLUSH = re.compile(r"router_stats\.host0\.shard(\d+)-step(\d+)\.json$")
 PHASES = ("prefill", "denoise_high", "denoise_mid", "denoise_low")
 WORKLOADS = (
@@ -46,6 +58,11 @@ WORKLOADS = (
     "reasoning_control",
 )
 NOISE_RATES = (0.85, 0.50, 0.15)
+RECONSTRUCTION_FIELDS = (
+    "shared_pre_router_residual",
+    "topk_indices",
+    "final_scaled_topk_weights",
+)
 
 
 def calibration_bucket_names() -> list[str]:
@@ -111,12 +128,63 @@ def usable_record_count(
     return usable
 
 
+def calibration_completion_status(
+    *,
+    total_records: int,
+    process_count: int,
+    processed_records: int,
+    max_records: int,
+    observed_input_tokens: int,
+    minimum_input_tokens: int,
+) -> dict[str, Any]:
+    """Classify a completed collector as gating or debug-only.
+
+    ``max_records`` is deliberately a pilot/debug control.  Even when its cap
+    happens to include the complete dataset, setting it makes the run
+    non-promotable so an operator cannot mistake a bounded invocation for the
+    precommitted full-corpus Stage-1 gate.
+    """
+    if max_records < 0 or observed_input_tokens < 0 or minimum_input_tokens < 0:
+        raise ValueError("calibration completion counts are invalid")
+    full_usable_records = usable_record_count(
+        total_records, process_count=process_count
+    )
+    expected_processed_records = usable_record_count(
+        total_records,
+        process_count=process_count,
+        max_records=max_records,
+    )
+    if processed_records != expected_processed_records:
+        raise ValueError("processed calibration records are outside the usable corpus")
+    debug_run = max_records > 0
+    full_corpus_consumed = (
+        not debug_run and processed_records == full_usable_records
+    )
+    minimum_tokens_observed = observed_input_tokens >= minimum_input_tokens
+    return {
+        "run_mode": "debug-capped" if debug_run else "full",
+        "debug_run": debug_run,
+        "max_records": max_records,
+        "source_records": total_records,
+        "full_usable_records": full_usable_records,
+        "processed_records": processed_records,
+        "full_corpus_consumed": full_corpus_consumed,
+        "observed_input_tokens": observed_input_tokens,
+        "minimum_observed_input_tokens": minimum_input_tokens,
+        "minimum_tokens_observed": minimum_tokens_observed,
+        "promotion_eligible": full_corpus_consumed and minimum_tokens_observed,
+    }
+
+
 def mass_candidate_payload(
     results: Sequence[Any],
     *,
     min_coverage: float,
     source_revision: str,
     dataset_manifest_sha256: str,
+    corpus_gcs_inventory_sha256: str,
+    calibration_run_sha256: str,
+    completion: Mapping[str, Any],
     retained_experts: int = 32,
     top_k_experts: int = 8,
     sunfish_source: Mapping[str, Any] | None = None,
@@ -129,13 +197,46 @@ def mass_candidate_payload(
         raise ValueError("mass candidate selection width differs from retained experts")
     if normalize_source_identity(sunfish_source) is None:
         raise ValueError("mass candidate requires a valid Sunfish source identity")
+    if not _SHA256.fullmatch(calibration_run_sha256) or not _SHA256.fullmatch(
+        corpus_gcs_inventory_sha256
+    ):
+        raise ValueError(
+            "mass candidate requires calibration-run and corpus-inventory digests"
+        )
+    required_completion = {
+        "run_mode",
+        "debug_run",
+        "full_usable_records",
+        "processed_records",
+        "full_corpus_consumed",
+        "observed_input_tokens",
+        "minimum_observed_input_tokens",
+        "minimum_tokens_observed",
+        "promotion_eligible",
+    }
+    if not required_completion <= completion.keys():
+        raise ValueError("mass candidate lacks calibration completion evidence")
+    debug_run = completion.get("debug_run") is True
+    promotion_eligible = completion.get("promotion_eligible") is True
+    expected_eligibility = (
+        not debug_run
+        and completion.get("run_mode") == "full"
+        and completion.get("full_corpus_consumed") is True
+        and completion.get("minimum_tokens_observed") is True
+    )
+    if promotion_eligible != expected_eligibility:
+        raise ValueError("mass candidate has inconsistent promotion eligibility")
+    if debug_run:
+        purpose_suffix = "debug-non-promotable"
+    elif not promotion_eligible:
+        purpose_suffix = "incomplete-non-promotable"
+    else:
+        purpose_suffix = "pending-reconstruction"
     return {
         "schema_version": 1,
-        "purpose": (
-            f"stage-1-{retained_experts}e-router-mass-candidate-"
-            "pending-reconstruction"
-        ),
+        "purpose": f"stage-1-{retained_experts}e-router-mass-candidate-{purpose_suffix}",
         "promotion_allowed": False,
+        "promotion_eligible": promotion_eligible,
         "selection_method": "coverage-constrained-router-mass",
         "source_experts": 128,
         "retained_experts": retained_experts,
@@ -145,6 +246,18 @@ def mass_candidate_payload(
         "reconstruction_gate_satisfied": False,
         "source_revision": source_revision,
         "dataset_manifest_sha256": dataset_manifest_sha256,
+        "corpus_gcs_inventory_sha256": corpus_gcs_inventory_sha256,
+        "calibration_run_sha256": calibration_run_sha256,
+        "calibration_mode": completion["run_mode"],
+        "debug_run": debug_run,
+        "full_usable_records": int(completion["full_usable_records"]),
+        "processed_records": int(completion["processed_records"]),
+        "full_corpus_consumed": completion["full_corpus_consumed"] is True,
+        "observed_input_tokens": int(completion["observed_input_tokens"]),
+        "minimum_observed_input_tokens": int(
+            completion["minimum_observed_input_tokens"]
+        ),
+        "minimum_tokens_observed": completion["minimum_tokens_observed"] is True,
         "sunfish_source": dict(sunfish_source),
         "layers": {
             str(layer): list(result.selected)
@@ -164,7 +277,13 @@ def mass_candidate_payload(
 class CalibrationSource:
     """Bucket-aware wrapper around the production GCS range-read source."""
 
-    def __init__(self, directory: str, expected_manifest_sha256: str):
+    def __init__(
+        self,
+        directory: str,
+        expected_manifest_sha256: str,
+        *,
+        validated_source_contract: Mapping[str, object],
+    ):
         from etils import epath
         from sunfish_tpu.training.data import EPathShardedRecordSource
 
@@ -176,6 +295,20 @@ class CalibrationSource:
                 f"calibration manifest mismatch: expected {expected_manifest_sha256}, got {actual}"
             )
         manifest = json.loads(manifest_bytes)
+        if validated_source_contract.get("promotion_allowed") is not True:
+            raise ValueError("calibration source contract is not promotable")
+        if manifest.get("source_profile") != validated_source_contract.get(
+            "source_profile"
+        ) or manifest.get("source_receipt_sha256") != validated_source_contract.get(
+            "source_receipt_sha256"
+        ):
+            raise ValueError("calibration manifest differs from validated source contract")
+        if manifest.get("corpus_gcs_inventory_sha256") != (
+            validated_source_contract.get("corpus_gcs_inventory_sha256")
+        ):
+            raise ValueError(
+                "calibration manifest corpus inventory differs from validated contract"
+            )
         failures = manifest.get("failures", ())
         if failures:
             raise ValueError("calibration manifest records failed source buckets")
@@ -186,7 +319,9 @@ class CalibrationSource:
         self._source = EPathShardedRecordSource(
             directory,
             expected_manifest_sha256=expected_manifest_sha256,
-            verify_shard_hashes=False,
+            # Metadata is checked before JAX; this exact byte check ensures the
+            # source opened for use still matches every manifest SHA-256.
+            verify_shard_hashes=True,
         )
         self._ends: list[int] = []
         self._workloads: list[str] = []
@@ -208,6 +343,14 @@ class CalibrationSource:
         return len(self._source)
 
     def __getitem__(self, index: int):
+        if isinstance(index, bool):
+            raise TypeError("calibration source index must be an integer")
+        try:
+            index = operator.index(index)
+        except TypeError:
+            raise TypeError("calibration source index must be an integer") from None
+        if not 0 <= index < len(self._source):
+            raise IndexError("calibration source index out of range")
         shard = bisect.bisect_right(self._ends, index)
         return self._source[index], WORKLOADS.index(self._workloads[shard])
 
@@ -233,6 +376,8 @@ def _existing_reconstruction_counts(
     raw_output_dir: Any,
     *,
     process_index: int,
+    run_id: str,
+    calibration_run_sha256: str,
 ) -> tuple[dict[str, int], int]:
     """Recover immutable per-bucket quotas for this host after preemption."""
     counts = {
@@ -248,6 +393,12 @@ def _existing_reconstruction_counts(
             raise ValueError(f"unknown reconstruction manifest schema at {path}")
         if int(payload.get("process_index", -1)) != process_index:
             raise ValueError(f"reconstruction manifest host mismatch at {path}")
+        if (
+            payload.get("run_id") != run_id
+            or payload.get("calibration_run_sha256") != calibration_run_sha256
+            or payload.get("artifact_id") != path.stem
+        ):
+            raise ValueError(f"reconstruction manifest lineage mismatch at {path}")
         bucket = payload.get("bucket")
         if bucket not in counts:
             raise ValueError(f"unknown reconstruction bucket at {path}: {bucket!r}")
@@ -267,6 +418,23 @@ def _write_immutable(path: Any, payload: Mapping[str, Any]) -> None:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(encoded)
+
+
+def _broadcast_process0_error(
+    multihost_utils: Any, np: Any, message: str | None, *, limit: int = 16_384
+) -> str | None:
+    """Broadcast a caught process-0 finalization failure to every host."""
+    encoded = (message or "").encode("utf-8")
+    if len(encoded) >= limit:
+        encoded = encoded[: limit - 1]
+    payload = np.zeros((limit,), np.uint8)
+    if encoded:
+        payload[: len(encoded)] = np.frombuffer(encoded, np.uint8)
+    received = np.asarray(multihost_utils.broadcast_one_to_all(payload))
+    decoded = bytes(received.tolist()).split(b"\0", 1)[0].decode(
+        "utf-8", errors="replace"
+    )
+    return decoded or None
 
 
 def _first_local_replica(array: Any):
@@ -304,11 +472,13 @@ def run_calibration(
     min_coverage: float,
     fallback_min_coverage: float,
     min_source_tokens: int,
+    data_source_receipt_path: str = "",
+    data_source_receipt_sha256: str = "",
 ) -> dict[str, Any]:
     if not _RUN_ID.fullmatch(run_id):
         raise ValueError("invalid calibration run ID")
-    if not source_revision.strip():
-        raise ValueError("source revision is required")
+    if not _GCS_REVISION.fullmatch(source_revision):
+        raise ValueError("source revision must be a GCS inventory SHA-256")
     if not _SHA256.fullmatch(readiness_ledger_sha256):
         raise ValueError("readiness ledger SHA-256 is invalid")
     require_launcher_run_id(run_id)
@@ -321,11 +491,63 @@ def run_calibration(
         or not 0.0 <= fallback_min_coverage <= 1.0
     ):
         raise ValueError("reconstruction/coverage values are invalid")
+    canonical = {
+        "minimum calibration input tokens": (
+            min_source_tokens,
+            MIN_CALIBRATION_INPUT_TOKENS,
+        ),
+        "32E router-mass coverage": (min_coverage, MASS_COVERAGE_32),
+        "48E router-mass coverage": (
+            fallback_min_coverage,
+            MASS_COVERAGE_48,
+        ),
+        "reconstruction sample tokens": (
+            reconstruction_tokens,
+            RECONSTRUCTION_SAMPLE_TOKENS,
+        ),
+    }
+    changed = [
+        f"{name}={actual!r} (required {expected!r})"
+        for name, (actual, expected) in canonical.items()
+        if actual != expected
+    ]
+    if changed:
+        raise ValueError(
+            "Stage-1 promotion thresholds are canonical and non-overridable: "
+            + "; ".join(changed)
+        )
 
     # The Stage-0.5 receipt is storage/control-plane state, not a JAX backend
     # dependency. Refuse an unauthorized Stage-1 launch before touching TPU.
     from etils import epath
     from sunfish_tpu.readiness_ledger import validate_readiness_unlock
+
+    if not data_source_receipt_path:
+        raise ValueError("Stage-1 calibration requires a reviewed source receipt")
+    data_manifest_bytes = (epath.Path(data_directory) / "manifest.json").read_bytes()
+    actual_data_manifest_sha256 = hashlib.sha256(data_manifest_bytes).hexdigest()
+    if actual_data_manifest_sha256 != data_manifest_sha256:
+        raise ValueError(
+            "calibration manifest bytes differ before TPU initialization: "
+            f"{actual_data_manifest_sha256} != {data_manifest_sha256}"
+        )
+    try:
+        data_manifest = json.loads(data_manifest_bytes)
+    except json.JSONDecodeError as error:
+        raise ValueError("calibration manifest is invalid JSON") from error
+    if not isinstance(data_manifest, Mapping):
+        raise ValueError("calibration manifest must be a JSON object")
+    data_source_receipt_bytes = epath.Path(data_source_receipt_path).read_bytes()
+    validated_source_contract = validate_calibration_source_contract(
+        data_manifest,
+        data_source_receipt_bytes,
+        expected_receipt_sha256=data_source_receipt_sha256,
+    )
+    live_corpus_gcs_inventory = verify_live_calibration_data_inventory(
+        data_directory,
+        data_manifest,
+        validated_source_contract["corpus_gcs_inventory"],
+    )
 
     current_source_identity = source_identity_from_environment(required=True)
     readiness_path = epath.Path(readiness_ledger_path)
@@ -371,7 +593,11 @@ def run_calibration(
         require_parameter_count,
     )
     from sunfish_tpu.reconstruction_drain import ReconstructionDrain
-    from sunfish_tpu.gcs_inventory import build_gcs_inventory
+    from sunfish_tpu.reconstruction_inventory import build_artifact_inventory
+    from sunfish_tpu.gcs_inventory import (
+        build_gcs_inventory,
+        verify_live_gcs_inventory,
+    )
     from sunfish_tpu.teacher_sharding import make_teacher_mesh_and_shardings
     from sunfish_tpu.training.checkpoint import _validate_exact_tree
     from sunfish_tpu.training.model import make_gemma_network
@@ -410,7 +636,11 @@ def run_calibration(
 
     root = epath.Path(output_dir) / run_id
     raw_root = epath.Path(raw_output_dir) / run_id
-    source = CalibrationSource(data_directory, data_manifest_sha256)
+    source = CalibrationSource(
+        data_directory,
+        data_manifest_sha256,
+        validated_source_contract=validated_source_contract,
+    )
     if source.record_tokens > prompt_length + canvas_size:
         raise ValueError(
             "calibration records exceed prompt+canvas capacity; rebuild fixed windows"
@@ -423,7 +653,20 @@ def run_calibration(
     usable = usable_record_count(
         len(source), process_count=expected_processes, max_records=max_records
     )
+    full_usable = usable_record_count(
+        len(source), process_count=expected_processes
+    )
     steps = usable // expected_processes
+    debug_run = max_records > 0
+    maximum_usable_input_tokens = min(
+        source.total_tokens, full_usable * source.record_tokens
+    )
+    if not debug_run and maximum_usable_input_tokens < min_source_tokens:
+        raise ValueError(
+            "full usable calibration prefix can contain at most "
+            f"{maximum_usable_input_tokens:,} input tokens; "
+            f"at least {min_source_tokens:,} are required"
+        )
     identity = {
         "schema_version": 1,
         "run_id": run_id,
@@ -434,12 +677,26 @@ def run_calibration(
         "readiness_ledger_sha256": readiness_ledger_sha256,
         "dataset_directory": data_directory,
         "dataset_manifest_sha256": data_manifest_sha256,
+        "dataset_source_receipt": data_source_receipt_path,
+        "dataset_source_receipt_sha256": data_source_receipt_sha256,
+        "dataset_source_profile": validated_source_contract["source_profile"],
+        "corpus_gcs_inventory": live_corpus_gcs_inventory,
+        "corpus_gcs_inventory_sha256": live_corpus_gcs_inventory["sha256"],
+        "run_mode": "debug-capped" if debug_run else "full",
+        "debug_run": debug_run,
+        "max_records": max_records,
+        "source_records": len(source),
+        "full_usable_records": full_usable,
         "usable_records": usable,
         "source_tokens": source.total_tokens,
+        "maximum_usable_input_tokens": maximum_usable_input_tokens,
         "minimum_source_tokens": min_source_tokens,
+        "reconstruction_sample_tokens": reconstruction_tokens,
         "record_tokens": source.record_tokens,
         "collective_steps": steps,
         "discarded_tail_records": len(source) - usable,
+        "process_divisibility_tail_records": len(source) - full_usable,
+        "capped_records": full_usable - usable,
         "prompt_length": prompt_length,
         "canvas_size": canvas_size,
         "flush_every_records": flush_every_records,
@@ -466,6 +723,9 @@ def run_calibration(
     multihost_utils.sync_global_devices(f"sunfish-calibration-identity-{run_id}")
     if json.loads((root / "calibration-run.json").read_text()) != identity:
         raise RuntimeError("calibration identity readback differs")
+    calibration_run_sha256 = hashlib.sha256(
+        (root / "calibration-run.json").read_bytes()
+    ).hexdigest()
 
     network = make_gemma_network(
         num_experts=128,
@@ -493,6 +753,12 @@ def run_calibration(
         params=sharded_target,
         donate=False,
         text_only=True,
+    )
+    # Span the actual multi-host checkpoint read with generation/CRC checks.
+    # A same-size replacement during load changes either generation or CRC and
+    # invalidates this attempt before any calibration evidence is emitted.
+    verify_live_gcs_inventory(
+        source_checkpoint, source_gcs_inventory, anonymous=source_anonymous
     )
     _validate_exact_tree(sharded_target, params)
     source_signature = _tree_signature(params, flax)
@@ -666,6 +932,8 @@ def run_calibration(
         _existing_reconstruction_counts(
             raw_root,
             process_index=int(jax.process_index()),
+            run_id=run_id,
+            calibration_run_sha256=calibration_run_sha256,
         )
     )
     if any(
@@ -678,6 +946,8 @@ def run_calibration(
     drain = ReconstructionDrain(
         output_dir=str(raw_root),
         process_index=int(jax.process_index()),
+        run_id=run_id,
+        calibration_run_sha256=calibration_run_sha256,
         max_tokens=per_host_reconstruction_cap,
         initial_tokens=existing_reconstruction_tokens,
     )
@@ -857,6 +1127,23 @@ def run_calibration(
         artifact_manifests = drain.close()
 
     multihost_utils.sync_global_devices(f"sunfish-calibration-artifacts-{run_id}")
+    corpus_inventory_error = None
+    if int(jax.process_index()) == 0:
+        try:
+            verify_live_calibration_data_inventory(
+                data_directory,
+                data_manifest,
+                live_corpus_gcs_inventory,
+            )
+        except Exception as error:
+            corpus_inventory_error = f"{type(error).__name__}: {error}"
+    corpus_inventory_error = _broadcast_process0_error(
+        multihost_utils, np, corpus_inventory_error
+    )
+    if corpus_inventory_error is not None:
+        raise RuntimeError(
+            "calibration corpus changed while in use: " + corpus_inventory_error
+        )
     reconstruction_buckets = [
         f"{phase}/{workload}" for phase in PHASES for workload in WORKLOADS
     ]
@@ -881,9 +1168,26 @@ def run_calibration(
             for value in global_reconstruction_counts
         )
     )
-    summary = None
-    if int(jax.process_index()) == 0:
+
+    def finalize_calibration():
         merged = merge_flushes(root, require_phase_coverage=True)
+        # Prefill and denoise-high each cover one copy of the source record's
+        # disjoint prompt/canvas split. Their sum is therefore the number of
+        # input tokens actually observed, rather than the manifest's claim.
+        observed_input_tokens = sum(
+            merged.tokens(bucket)
+            for bucket in merged.buckets
+            if bucket.startswith("prefill/")
+            or bucket.startswith("denoise_high/")
+        )
+        completion = calibration_completion_status(
+            total_records=len(source),
+            process_count=expected_processes,
+            processed_records=usable,
+            max_records=max_records,
+            observed_input_tokens=observed_input_tokens,
+            minimum_input_tokens=min_source_tokens,
+        )
         bucket_weights = {
             bucket: (0.25 if bucket.split("/")[1].endswith("control") else 1.0)
             for bucket in merged.buckets
@@ -905,6 +1209,9 @@ def run_calibration(
             min_coverage=min_coverage,
             source_revision=source_revision,
             dataset_manifest_sha256=data_manifest_sha256,
+            corpus_gcs_inventory_sha256=live_corpus_gcs_inventory["sha256"],
+            calibration_run_sha256=calibration_run_sha256,
+            completion=completion,
             sunfish_source=current_source_identity,
         )
         fallback_candidate = mass_candidate_payload(
@@ -912,19 +1219,58 @@ def run_calibration(
             min_coverage=fallback_min_coverage,
             source_revision=source_revision,
             dataset_manifest_sha256=data_manifest_sha256,
+            corpus_gcs_inventory_sha256=live_corpus_gcs_inventory["sha256"],
+            calibration_run_sha256=calibration_run_sha256,
+            completion=completion,
             retained_experts=48,
             sunfish_source=current_source_identity,
         )
-        _write_immutable(root / "selection-mass-candidate.json", candidate)
-        _write_immutable(
-            root / "selection-mass-candidate-48e.json", fallback_candidate
+        if completion["promotion_eligible"]:
+            candidate_path = root / "selection-mass-candidate.json"
+            fallback_candidate_path = root / "selection-mass-candidate-48e.json"
+        else:
+            candidate_path = root / "selection-mass-debug-candidate.json"
+            fallback_candidate_path = (
+                root / "selection-mass-debug-candidate-48e.json"
+            )
+        _write_immutable(candidate_path, candidate)
+        _write_immutable(fallback_candidate_path, fallback_candidate)
+        candidate_sha256 = hashlib.sha256(candidate_path.read_bytes()).hexdigest()
+        fallback_candidate_sha256 = hashlib.sha256(
+            fallback_candidate_path.read_bytes()
+        ).hexdigest()
+        candidates_promotion_eligible = bool(
+            candidate["promotion_eligible"]
+            and fallback_candidate["promotion_eligible"]
         )
-        observed_input_tokens = sum(
-            merged.tokens(bucket)
-            for bucket in merged.buckets
-            if bucket.startswith("prefill/")
-            or bucket.startswith("denoise_high/")
+        if completion["promotion_eligible"] != candidates_promotion_eligible:
+            raise RuntimeError(
+                "mass candidate promotion status differs from calibration completion"
+            )
+        artifact_inventory = build_artifact_inventory(
+            raw_root,
+            run_id=run_id,
+            calibration_run_sha256=calibration_run_sha256,
+            expected_processes=expected_processes,
+            allowed_buckets=reconstruction_buckets,
+            field_names=RECONSTRUCTION_FIELDS,
         )
+        inventory_counts = np.asarray(
+            [
+                artifact_inventory["tokens_by_bucket"][bucket]
+                for bucket in reconstruction_buckets
+            ],
+            np.int64,
+        )
+        if not np.array_equal(inventory_counts, global_reconstruction_counts):
+            raise RuntimeError(
+                "reconstruction artifact inventory differs from gathered host counts"
+            )
+        artifact_inventory_path = root / "reconstruction-artifact-inventory.json"
+        _write_immutable(artifact_inventory_path, artifact_inventory)
+        artifact_inventory_sha256 = hashlib.sha256(
+            artifact_inventory_path.read_bytes()
+        ).hexdigest()
         summary = {
             "schema_version": 1,
             "run_id": run_id,
@@ -937,16 +1283,34 @@ def run_calibration(
             ],
             "reconstruction_gate_satisfied": False,
             "promotion_allowed": False,
+            "promotion_eligible": completion["promotion_eligible"],
+            "run_mode": completion["run_mode"],
+            "debug_run": completion["debug_run"],
+            "max_records": completion["max_records"],
+            "source_records": completion["source_records"],
+            "full_usable_records": completion["full_usable_records"],
+            "processed_records": completion["processed_records"],
+            "full_corpus_consumed": completion["full_corpus_consumed"],
+            "minimum_tokens_observed": completion["minimum_tokens_observed"],
+            "maximum_usable_input_tokens": maximum_usable_input_tokens,
             "collective_steps": steps,
             "observed_input_tokens": observed_input_tokens,
+            "minimum_observed_input_tokens": min_source_tokens,
+            "dataset_manifest_sha256": data_manifest_sha256,
+            "corpus_gcs_inventory_sha256": live_corpus_gcs_inventory["sha256"],
+            "calibration_run_sha256": calibration_run_sha256,
             "discarded_tail_records": len(source) - usable,
+            "process_divisibility_tail_records": len(source) - full_usable,
+            "capped_records": full_usable - usable,
             "flushes": sequence,
             "source_tree": source_signature,
-            "candidate": str(root / "selection-mass-candidate.json"),
-            "fallback_candidate": str(
-                root / "selection-mass-candidate-48e.json"
-            ),
+            "candidate": str(candidate_path),
+            "candidate_sha256": candidate_sha256,
+            "fallback_candidate": str(fallback_candidate_path),
+            "fallback_candidate_sha256": fallback_candidate_sha256,
             "raw_artifact_prefix": str(raw_root),
+            "artifact_inventory": str(artifact_inventory_path),
+            "artifact_inventory_sha256": artifact_inventory_sha256,
             "artifact_sample_satisfied": artifact_sample_satisfied,
             "artifact_tokens": int(global_reconstruction_counts.sum()),
             "artifact_tokens_by_bucket": {
@@ -957,6 +1321,22 @@ def run_calibration(
             "hardware_topology": topology,
         }
         _write_immutable(root / "summary.json", summary)
+        return summary
+
+    summary = None
+    finalization_error = None
+    if int(jax.process_index()) == 0:
+        try:
+            summary = finalize_calibration()
+        except Exception as error:  # propagate instead of stranding peer collectives
+            finalization_error = f"{type(error).__name__}: {error}"
+    finalization_error = _broadcast_process0_error(
+        multihost_utils, np, finalization_error
+    )
+    if finalization_error is not None:
+        raise RuntimeError(
+            "calibration process-0 finalization failed: " + finalization_error
+        )
     multihost_utils.sync_global_devices(f"sunfish-calibration-summary-{run_id}")
     return summary if summary is not None else {
         "schema_version": 1,
@@ -979,6 +1359,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--readiness-ledger-sha256", required=True)
     parser.add_argument("--data-directory", required=True)
     parser.add_argument("--data-manifest-sha256", required=True)
+    parser.add_argument("--data-source-receipt", required=True)
+    parser.add_argument("--data-source-receipt-sha256", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--raw-output-dir", required=True)
     parser.add_argument("--run-id", required=True)
@@ -1004,6 +1386,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             readiness_ledger_sha256=args.readiness_ledger_sha256,
             data_directory=args.data_directory,
             data_manifest_sha256=args.data_manifest_sha256,
+            data_source_receipt_path=args.data_source_receipt,
+            data_source_receipt_sha256=args.data_source_receipt_sha256,
             output_dir=args.output_dir,
             raw_output_dir=args.raw_output_dir,
             run_id=args.run_id,

@@ -16,7 +16,10 @@ The production loop is Kauldron's trainer, not a second Sunfish loop. Its
 Orbax checkpoint is one transaction containing model/optimizer/step state,
 timer state, and the checkpointable Grain iterator. RNG streams are pure
 functions of the checkpointed step and pinned run seed. A restart with the
-same workdir therefore resumes the complete deterministic state.
+same workdir therefore resumes the complete deterministic state. Sunfish's
+Kauldron checkpointer explicitly enables Orbax's startup cleanup for abandoned
+temporary step directories; an interrupted asynchronous save can therefore
+restart at the last finalized checkpoint without a manual GCS deletion.
 
 The all-host launcher also binds the run to its code: every worker must match
 the controller's Git commit and deterministic source-tree SHA-256 before the
@@ -26,8 +29,11 @@ ledger rejects evidence produced by a different tree. See
 verifies the raw config-file SHA-256 on every host; the run identity records
 both that byte hash and the canonical parsed-config digest.
 
-The implementation is under `src/sunfish_tpu/training/`; the stable Kauldron
-entry config is `configs/training/sunfish.py`.
+The implementation is under `src/sunfish_tpu/training/`; the installed-wheel
+runtime entry config is the packaged
+`src/sunfish_tpu/training/kauldron_config.py`. The
+`configs/training/sunfish.py` wrapper is retained only for checkout-local
+compatibility and is not used by `sunfish-train`.
 
 ## Training phases
 
@@ -37,6 +43,16 @@ entry config is `configs/training/sunfish.py`.
 | `router` | `router_logits`, `router_scale`, `per_expert_scale` | Phase A replicated |
 | `lora` | all `lora` leaves | Phase A replicated |
 | `full` | all parameters | evidence-gated Phase B FSDP |
+
+Gradient metrics follow the same boundary. Smoke and LoRA logs consume only
+`lora` gradient leaves; router logs consume only the three router parameter
+families. This lets XLA eliminate frozen base gradients instead of retaining a
+second model-sized bf16 tree for `gradient_norm`. Full training intentionally
+keeps the full-tree norm. Recovery/LoRA and full training also install the
+pinned Gemma SFT `nn.remat` policy at each Transformer `Block.__call__`
+boundary (`nothing_saveable`, `static_argnums=7`); signature drift fails before
+model construction. These are HBM controls, not evidence that an unmeasured
+topology or production batch fits.
 
 Sunfish LoRA covers attention, the dense shared MLP, self-conditioning, and
 the fused ragged-MoE expert banks. Google's adapter handles ordinary linear
@@ -247,8 +263,17 @@ worker with `scripts/deploy_tpu_offline_bundle.sh`. That script and all later
 transport use `gcloud alpha ... --worker=all --tunnel-through-iap` (SSH also
 uses `--batch-size=all`); workers install the complete resolved lock only from
 the local wheelhouse with
-`PIP_NO_INDEX=1 --no-index --no-deps`. Perform static validation against the
-rendered controller copy:
+`PIP_NO_INDEX=1 --no-index --no-deps`. The archive records the maximum glibc
+floor required by its native manylinux wheels; deployment and bootstrap check
+that floor on every worker. The base probe needs only stock CPython 3.10+; the
+connected builder downloads and hash/size-verifies the pinned
+python-build-standalone CPython 3.12.13 asset, uses it for every wheelhouse
+operation, and includes its archive plus URL-free metadata in the immutable
+release. Stock-Python-compatible predeploy helpers safely derive and verify
+`$SUNFISH_OFFLINE_BUNDLE_ROOT/python/` before the bootstrap, config uploader,
+or host entrypoint defaults to `python/bin/python3`. The base probe and host
+entrypoint also reject HTTP(S)/ALL proxy variables before JAX initialization.
+Perform static validation against the rendered controller copy:
 
 ```bash
 PYTHON_BIN=python3.12 VENV_DIR=.venv-tpu-controller \
@@ -276,6 +301,10 @@ scripts/launch_tpu_pod.sh \
 
 Launch the identical command on every worker:
 
+The controller environment must include the validated
+`XLA_PYTHON_CLIENT_PREALLOCATE=false` setting from `infra/tpu/job.env`; the
+launcher forwards it explicitly and the host entrypoint exports it before JAX.
+
 ```bash
 scripts/launch_tpu_pod.sh \
   --run-id "$SMOKE_RUN_ID" \
@@ -291,7 +320,17 @@ recovery path. The gate-7 process-interruption proof uses
 `sunfish-preemption-smoke.toml` and `sunfish-preemption-gate` with its own
 fresh workdir, so it cannot mistake a previously completed gate-4 run for a
 successful recovery. Gate 6 similarly uses `sunfish-resume-smoke.toml` and an
-empty workdir. Changing any other TOML field requires a new run ID/workdir.
+empty workdir; its entrypoint runs the control/save and restore/compare halves
+in separate sequential Python processes after closing the first Orbax manager.
+Each half owns a fresh process session; interrupts and normal phase exit apply
+bounded TERM-then-KILL cleanup to that exact group so Grain/Kauldron children
+cannot leak into the next half.
+Changing any other TOML field requires a new run ID/workdir.
+The Stage-0.5 renderer sets the readiness global batch to the measured global
+device count (one example per device), rather than blindly retaining the
+v4-64 template value on a smaller slice. The checked-in router/recovery TOMLs
+still describe the approved 32-device profile; a different grant requires a
+fresh source-bound production config and HBM pilot before either phase starts.
 
 ## Stage-0.5 mapping
 
@@ -300,11 +339,11 @@ empty workdir. Changing any other TOML field requires a new run ID/workdir.
 | 1. topology/collective | `sunfish-topology-smoke` via distributed-init-first all-host launcher | every host and real `psum` pass |
 | 2. disjoint GCS input | `sunfish-input-smoke` runs the production Grain/Kauldron process slice, persists every host's record IDs, and merges exact coverage | `summary.json`: no overlap, no missing IDs, one manifest |
 | 3. sharded seed load | `sunfish-seed-load-smoke` restores the real 8B seed into Phase-B target shardings | exact tree/shardings; each host/device resident bytes below a full model |
-| 4. 100-500 update smoke | `phase = "smoke"` + `sunfish-smoke-evidence` | ≥100 contiguous steps, finite/nonzero norms, ≥10% tiny-set loss reduction |
+| 4. 100-500 update smoke | `phase = "smoke"` + `sunfish-smoke-evidence` | ≥100 contiguous steps, finite/nonzero norms, ≥10% tiny-set loss reduction, complete per-device HBM snapshots, peak HBM ≤90% |
 | 5. save/restore | `sunfish-checkpoint-smoke` distributed composite state | every host observes exact GCS round trip |
-| 6. exact resume | `sunfish-real-resume-smoke` on the production model/optimizer/Grain/Orbax path | next batch/loss/trainable grad+update+params/full optimizer+collections+step exact; base frozen |
-| 7. recovery | `sunfish-preemption-gate` on a fresh identical-lineage workdir | finalized checkpoint survives an exact user-process interruption; unchanged relaunch starts its metric stream at the saved step rather than step 0 and completes without cleanup; the TPU VM is untouched |
-| 8. throughput | real trainer iterator waits divided by accelerator step time | p95 ≤10%, zero local cache |
+| 6. exact resume | `sunfish-real-resume-smoke` runs separate save/control and fresh-manager restore/compare Python processes on the production model/optimizer/Grain/Orbax path | embedded/recomputed prepare summary; one launcher lineage; distinct process tokens; next batch/loss/trainable grad+update+params/full optimizer+collections+step exact; base frozen |
+| 7. recovery | `sunfish-preemption-gate` on a fresh identical-lineage workdir | PID publication gates workload exec so a raced PID object cannot create an unrecorded descendant; finalized checkpoint survives an immutable pre-signal root+descendant PID/start-time snapshot and individual pidfd interruption; bounded all-worker and controller-group cleanup is proven; only signal status 137/143 authorizes resume, while cleanup status 126 or any unproven teardown is a non-retryable owner stop; unchanged relaunch starts at the saved step rather than step 0; the TPU VM is untouched |
+| 8. throughput | real trainer iterator waits divided by accelerator step time | p95 ≤10%, zero persistent/local-disk cache; exact two-batch-per-worker bounded Grain memory prefetch |
 
 No row in this table is a hardware pass until its evidence is recorded from
 the granted slice. `sunfish-readiness-ledger` hashes and validates all rows;

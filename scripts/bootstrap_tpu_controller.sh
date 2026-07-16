@@ -17,6 +17,7 @@ SUNFISH_CONTROLLER_PYTHON="${PYTHON_BIN}" \
 "${VENV_DIR}/bin/python" - <<'PY'
 from etils import epath
 from sunfish_tpu import (
+    calibration_data_inventory,
     deployment_config,
     gcs_inventory,
     offline_bundle,
@@ -31,6 +32,7 @@ assert callable(preemption_gate.main)
 assert callable(readiness_ledger.main)
 assert callable(smoke_evidence.main)
 assert callable(gcs_inventory.main)
+assert callable(calibration_data_inventory.main)
 assert callable(deployment_config.main)
 assert callable(offline_bundle.verify_bundle)
 assert callable(parity_evidence.validate_stage0_parity_report)

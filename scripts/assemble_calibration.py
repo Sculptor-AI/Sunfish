@@ -133,6 +133,9 @@ def assemble_bucket(
         "bucket": name,
         "dataset": dataset_id,
         "config": config,
+        "source_id": f"{dataset_id}:{config}",
+        "source_revision": "unresolved-streaming-head",
+        "source_status": "pilot-substitute-non-promotable",
         "seconds": round(time.time() - started, 1),
         "record_tokens": record_tokens,
         **info,
@@ -169,6 +172,7 @@ def main() -> None:
     from tokenizers import Tokenizer
 
     from sunfish.calibration_records import calibration_bucket_token_caps
+    from sunfish.calibration_records import CALIBRATION_BUCKET_PERCENT
     from sunfish.datashards import write_manifest
 
     tokenizer = Tokenizer.from_file(str(args.tokenizer))
@@ -211,6 +215,17 @@ def main() -> None:
         record_tokens=args.record_tokens,
         failures=failures,
         purpose="stage-1 router calibration",
+        promotion_allowed=False,
+        source_profile="pilot-substitutes-v1",
+        source_receipt_sha256=None,
+        bucket_token_shares={
+            bucket: percent / 100.0
+            for bucket, percent in CALIBRATION_BUCKET_PERCENT.items()
+        },
+        non_promotion_reason=(
+            "assembler sources include unresolved pilot substitutes and no "
+            "reviewed immutable source receipt"
+        ),
     )
     print(json.dumps({
         "total_tokens": sum(r["tokens"] for r in results),

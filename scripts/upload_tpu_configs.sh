@@ -25,6 +25,11 @@ done
 : "${TPU_NAME:?set TPU_NAME}"
 : "${PROJECT_ID:?set PROJECT_ID}"
 : "${ZONE:?set ZONE}"
+: "${SUNFISH_OFFLINE_BUNDLE_ROOT:?set the deployed offline bundle root}"
+[[ "${SUNFISH_OFFLINE_BUNDLE_ROOT}" == /* ]] || {
+  echo "SUNFISH_OFFLINE_BUNDLE_ROOT must be an absolute worker path" >&2
+  exit 2
+}
 
 files=(
   sunfish-smoke.toml
@@ -41,7 +46,7 @@ for filename in "${files[@]}"; do
 done
 
 controller_python="${SUNFISH_CONTROLLER_PYTHON:-python3}"
-remote_python="${SUNFISH_REMOTE_PYTHON_BIN:-python3.12}"
+remote_python="${SUNFISH_REMOTE_PYTHON_BIN:-${SUNFISH_OFFLINE_BUNDLE_ROOT}/python/bin/python3}"
 PYTHONPATH=src "${controller_python}" -c \
   'import pathlib,sys; from sunfish_tpu.deployment_config import validate_rendered_config_file; validate_rendered_config_file(pathlib.Path(sys.argv[1]), source_root=pathlib.Path(sys.argv[2]), require_bundle=True)' \
   "${local_dir}/sunfish-smoke.toml" "$(pwd)"

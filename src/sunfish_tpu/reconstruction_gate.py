@@ -19,6 +19,9 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from sunfish_tpu.calibration import PHASES, WORKLOADS
+from sunfish_tpu.calibration_data_inventory import (
+    validate_calibration_data_inventory_payload,
+)
 from sunfish_tpu.tpu_preflight import (
     _topology_checks,
     initialize_distributed_jax,
@@ -28,6 +31,22 @@ from sunfish_tpu.source_identity import (
     normalize_source_identity,
     require_launcher_run_id,
     source_identity_from_environment,
+)
+from sunfish_tpu.reconstruction_inventory import (
+    paths_for_process,
+    validate_artifact_inventory,
+    verify_live_artifact_inventory,
+)
+from sunfish_tpu.stage1_contract import (
+    APPROVED_SELECTION_METHOD,
+    APPROVED_SELECTION_PURPOSE,
+    MASS_COVERAGE_BY_EXPERTS,
+    MIN_CALIBRATION_INPUT_TOKENS,
+    RECONSTRUCTION_MAX_RELATIVE_RMSE,
+    RECONSTRUCTION_MIN_COSINE_SIMILARITY,
+    RECONSTRUCTION_MIN_TOKENS_PER_BUCKET,
+    RECONSTRUCTION_SAMPLE_TOKENS,
+    reconstruction_thresholds,
 )
 
 NUM_LAYERS = 30
@@ -170,6 +189,219 @@ def summarize_reconstruction(
     }
 
 
+def validate_calibration_for_reconstruction(
+    calibration_identity: Mapping[str, Any],
+    calibration_summary: Mapping[str, Any],
+    mass_candidate: Mapping[str, Any],
+    *,
+    calibration_run_sha256: str,
+    calibration_summary_sha256: str,
+    mass_candidate_sha256: str,
+    mass_candidate_path: str,
+) -> dict[str, Any]:
+    """Validate the full-corpus receipt required before reconstruction."""
+    for digest in (
+        calibration_run_sha256,
+        calibration_summary_sha256,
+        mass_candidate_sha256,
+    ):
+        if not _SHA256.fullmatch(digest):
+            raise ValueError("calibration promotion provenance requires SHA-256 digests")
+    if calibration_identity.get("schema_version") != 1:
+        raise ValueError("calibration identity has an unsupported schema")
+    if calibration_summary.get("schema_version") != 1:
+        raise ValueError("calibration summary has an unsupported schema")
+    run_id = calibration_identity.get("run_id")
+    if not isinstance(run_id, str) or calibration_summary.get("run_id") != run_id:
+        raise ValueError("calibration identity and summary run IDs differ")
+    if (
+        calibration_identity.get("run_mode") != "full"
+        or calibration_identity.get("debug_run") is not False
+        or calibration_identity.get("max_records") != 0
+    ):
+        raise ValueError("debug/capped calibration cannot authorize reconstruction")
+    corpus_inventory = calibration_identity.get("corpus_gcs_inventory")
+    dataset_directory = calibration_identity.get("dataset_directory")
+    if not isinstance(corpus_inventory, Mapping) or not isinstance(
+        dataset_directory, str
+    ):
+        raise ValueError("calibration identity has no corpus GCS inventory")
+    canonical_corpus_inventory = validate_calibration_data_inventory_payload(
+        corpus_inventory, expected_directory=dataset_directory
+    )
+    corpus_inventory_sha256 = calibration_identity.get(
+        "corpus_gcs_inventory_sha256"
+    )
+    if (
+        not isinstance(corpus_inventory_sha256, str)
+        or not _SHA256.fullmatch(corpus_inventory_sha256)
+        or corpus_inventory_sha256 != canonical_corpus_inventory["sha256"]
+    ):
+        raise ValueError("calibration identity corpus GCS inventory digest differs")
+
+    try:
+        source_records = int(calibration_identity["source_records"])
+        full_usable_records = int(calibration_identity["full_usable_records"])
+        usable_records = int(calibration_identity["usable_records"])
+        collective_steps = int(calibration_identity["collective_steps"])
+        source_tokens = int(calibration_identity["source_tokens"])
+        record_tokens = int(calibration_identity["record_tokens"])
+        maximum_usable_input_tokens = int(
+            calibration_identity["maximum_usable_input_tokens"]
+        )
+        minimum_input_tokens = int(calibration_identity["minimum_source_tokens"])
+        observed_input_tokens = int(calibration_summary["observed_input_tokens"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("calibration completion counts are missing or invalid") from error
+    if not 0 < full_usable_records == usable_records <= source_records:
+        raise ValueError("calibration identity does not cover its full usable corpus")
+    topology = calibration_identity.get("topology")
+    try:
+        process_count = int(topology["processes"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("calibration identity has invalid process topology") from error
+    if (
+        collective_steps <= 0
+        or process_count <= 0
+        or collective_steps * process_count != full_usable_records
+        or not 0 <= source_records - full_usable_records < process_count
+        or source_tokens <= 0
+        or record_tokens < 2
+        or maximum_usable_input_tokens
+        != min(source_tokens, full_usable_records * record_tokens)
+        or minimum_input_tokens != MIN_CALIBRATION_INPUT_TOKENS
+        or calibration_identity.get("reconstruction_sample_tokens")
+        != RECONSTRUCTION_SAMPLE_TOKENS
+        or calibration_identity.get("coverage_floors")
+        != {
+            "32_experts": MASS_COVERAGE_BY_EXPERTS[32],
+            "48_experts": MASS_COVERAGE_BY_EXPERTS[48],
+        }
+    ):
+        raise ValueError("calibration identity has invalid step/token thresholds")
+
+    required_true = (
+        "execution_completed",
+        "run_succeeded",
+        "artifact_sample_satisfied",
+        "promotion_eligible",
+        "full_corpus_consumed",
+        "minimum_tokens_observed",
+    )
+    if any(calibration_summary.get(key) is not True for key in required_true):
+        raise ValueError("calibration summary is incomplete or non-promotable")
+    if (
+        calibration_summary.get("run_mode") != "full"
+        or calibration_summary.get("debug_run") is not False
+        or calibration_summary.get("max_records") != 0
+    ):
+        raise ValueError("calibration summary describes a debug/capped run")
+    if calibration_summary.get("calibration_run_sha256") != calibration_run_sha256:
+        raise ValueError("calibration summary is not bound to the calibration identity")
+    if calibration_summary.get("dataset_manifest_sha256") != (
+        calibration_identity.get("dataset_manifest_sha256")
+    ):
+        raise ValueError("calibration summary dataset differs from its identity")
+    if (
+        calibration_summary.get("corpus_gcs_inventory_sha256")
+        != corpus_inventory_sha256
+    ):
+        raise ValueError("calibration summary corpus inventory differs from identity")
+    if (
+        calibration_summary.get("source_records") != source_records
+        or calibration_summary.get("full_usable_records") != full_usable_records
+        or calibration_summary.get("processed_records") != full_usable_records
+        or calibration_summary.get("collective_steps") != collective_steps
+        or calibration_summary.get("maximum_usable_input_tokens")
+        != maximum_usable_input_tokens
+    ):
+        raise ValueError("calibration summary record/step coverage is incomplete")
+    if calibration_summary.get("minimum_observed_input_tokens") != minimum_input_tokens:
+        raise ValueError("calibration summary changed the input-token threshold")
+    if observed_input_tokens < minimum_input_tokens:
+        raise ValueError("calibration observed fewer input tokens than required")
+    if observed_input_tokens > maximum_usable_input_tokens:
+        raise ValueError("calibration observed more input tokens than its usable corpus")
+
+    if mass_candidate.get("schema_version") != 1:
+        raise ValueError("mass candidate has an unsupported schema")
+    if mass_candidate.get("mass_gate_satisfied") is not True:
+        raise ValueError("mass candidate did not pass")
+    if mass_candidate.get("source_revision") != calibration_identity.get(
+        "source_revision"
+    ):
+        raise ValueError("mass candidate source revision differs from calibration")
+    if mass_candidate.get("promotion_allowed") is not False:
+        raise ValueError("mass candidate has an invalid promotion state")
+    required_candidate_true = (
+        "promotion_eligible",
+        "full_corpus_consumed",
+        "minimum_tokens_observed",
+    )
+    if any(mass_candidate.get(key) is not True for key in required_candidate_true):
+        raise ValueError("mass candidate is not backed by full calibration")
+    if (
+        mass_candidate.get("calibration_mode") != "full"
+        or mass_candidate.get("debug_run") is not False
+        or mass_candidate.get("calibration_run_sha256") != calibration_run_sha256
+    ):
+        raise ValueError("mass candidate is bound to a debug or different calibration")
+    if (
+        mass_candidate.get("dataset_manifest_sha256")
+        != calibration_identity.get("dataset_manifest_sha256")
+        or mass_candidate.get("corpus_gcs_inventory_sha256")
+        != corpus_inventory_sha256
+        or mass_candidate.get("observed_input_tokens") != observed_input_tokens
+        or mass_candidate.get("minimum_observed_input_tokens")
+        != minimum_input_tokens
+        or mass_candidate.get("full_usable_records") != full_usable_records
+        or mass_candidate.get("processed_records") != full_usable_records
+    ):
+        raise ValueError("mass candidate calibration counts or dataset differ")
+
+    retained_experts = mass_candidate.get("retained_experts")
+    if retained_experts == 32:
+        summary_path_key = "candidate"
+        summary_digest_key = "candidate_sha256"
+        summary_mass_key = "mass_gate_satisfied"
+    elif retained_experts == 48:
+        summary_path_key = "fallback_candidate"
+        summary_digest_key = "fallback_candidate_sha256"
+        summary_mass_key = "fallback_48_mass_gate_satisfied"
+    else:
+        raise ValueError("mass candidate retained-expert rung is unsupported")
+    if (
+        mass_candidate.get("min_coverage")
+        != MASS_COVERAGE_BY_EXPERTS[retained_experts]
+    ):
+        raise ValueError("mass candidate changed the canonical coverage floor")
+    if (
+        calibration_summary.get(summary_path_key) != mass_candidate_path
+        or calibration_summary.get(summary_digest_key) != mass_candidate_sha256
+        or calibration_summary.get(summary_mass_key) is not True
+    ):
+        raise ValueError("mass candidate is not the one recorded by calibration")
+    if normalize_source_identity(mass_candidate.get("sunfish_source")) != (
+        normalize_source_identity(calibration_identity.get("sunfish_source"))
+    ):
+        raise ValueError("mass candidate source tree differs from calibration")
+    return {
+        "calibration_run_sha256": calibration_run_sha256,
+        "calibration_summary_sha256": calibration_summary_sha256,
+        "observed_input_tokens": observed_input_tokens,
+        "minimum_observed_input_tokens": minimum_input_tokens,
+        "maximum_usable_input_tokens": maximum_usable_input_tokens,
+        "source_records": source_records,
+        "full_usable_records": full_usable_records,
+        "processed_records": full_usable_records,
+        "dataset_manifest_sha256": calibration_identity[
+            "dataset_manifest_sha256"
+        ],
+        "corpus_gcs_inventory_sha256": corpus_inventory_sha256,
+        "mass_min_coverage": MASS_COVERAGE_BY_EXPERTS[retained_experts],
+    }
+
+
 def approved_selection_payload(
     mass_candidate: Mapping[str, Any],
     reconstruction: Mapping[str, Any],
@@ -177,12 +409,15 @@ def approved_selection_payload(
     mass_candidate_sha256: str,
     reconstruction_run_sha256: str,
     reconstruction_summary_sha256: str,
+    calibration_provenance: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Build the only selection sidecar accepted by non-smoke seed creation."""
     if not mass_candidate.get("mass_gate_satisfied"):
         raise ValueError("router-mass candidate did not pass")
     if mass_candidate.get("promotion_allowed"):
         raise ValueError("mass-only candidate must not already be promotable")
+    if mass_candidate.get("promotion_eligible") is not True:
+        raise ValueError("mass-only candidate is not backed by full calibration")
     if not reconstruction.get("passed"):
         raise ValueError("reconstruction gate did not pass")
     if normalize_source_identity(mass_candidate.get("sunfish_source")) is None:
@@ -191,16 +426,58 @@ def approved_selection_payload(
         mass_candidate_sha256,
         reconstruction_run_sha256,
         reconstruction_summary_sha256,
+        calibration_provenance.get("calibration_run_sha256"),
+        calibration_provenance.get("calibration_summary_sha256"),
+        calibration_provenance.get("artifact_inventory_sha256"),
+        calibration_provenance.get("corpus_gcs_inventory_sha256"),
     ):
-        if not _SHA256.fullmatch(digest):
+        if not isinstance(digest, str) or not _SHA256.fullmatch(digest):
             raise ValueError("promotion provenance requires SHA-256 digests")
+    try:
+        observed_input_tokens = int(calibration_provenance["observed_input_tokens"])
+        minimum_input_tokens = int(
+            calibration_provenance["minimum_observed_input_tokens"]
+        )
+        full_usable_records = int(calibration_provenance["full_usable_records"])
+        processed_records = int(calibration_provenance["processed_records"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("promotion calibration counts are invalid") from error
+    if (
+        minimum_input_tokens != MIN_CALIBRATION_INPUT_TOKENS
+        or observed_input_tokens < minimum_input_tokens
+        or not 0 < processed_records == full_usable_records
+        or mass_candidate.get("observed_input_tokens") != observed_input_tokens
+        or mass_candidate.get("full_usable_records") != full_usable_records
+        or mass_candidate.get("processed_records") != processed_records
+        or mass_candidate.get("calibration_run_sha256")
+        != calibration_provenance.get("calibration_run_sha256")
+        or mass_candidate.get("dataset_manifest_sha256")
+        != calibration_provenance.get("dataset_manifest_sha256")
+        or mass_candidate.get("corpus_gcs_inventory_sha256")
+        != calibration_provenance.get("corpus_gcs_inventory_sha256")
+    ):
+        raise ValueError("promotion calibration coverage is incomplete")
+    retained_experts = mass_candidate.get("retained_experts")
+    if (
+        retained_experts not in MASS_COVERAGE_BY_EXPERTS
+        or mass_candidate.get("min_coverage")
+        != MASS_COVERAGE_BY_EXPERTS[retained_experts]
+        or calibration_provenance.get("mass_min_coverage")
+        != MASS_COVERAGE_BY_EXPERTS[retained_experts]
+    ):
+        raise ValueError("promotion router-mass threshold differs from canonical")
+    expected_thresholds = reconstruction_thresholds()
+    if reconstruction.get("thresholds") != expected_thresholds:
+        raise ValueError("promotion reconstruction thresholds differ from canonical")
+    if reconstruction.get("calibration_provenance") != dict(
+        calibration_provenance
+    ):
+        raise ValueError("reconstruction summary changed calibration provenance")
     return {
         "schema_version": 1,
-        "purpose": "stage-1-router-selection-approved",
+        "purpose": APPROVED_SELECTION_PURPOSE,
         "promotion_allowed": True,
-        "selection_method": (
-            "coverage-constrained-router-mass-plus-layer-output-reconstruction"
-        ),
+        "selection_method": APPROVED_SELECTION_METHOD,
         "source_experts": SOURCE_EXPERTS,
         "retained_experts": mass_candidate["retained_experts"],
         "top_k_experts": mass_candidate["top_k_experts"],
@@ -208,6 +485,23 @@ def approved_selection_payload(
         "dataset_manifest_sha256": mass_candidate["dataset_manifest_sha256"],
         "sunfish_source": mass_candidate["sunfish_source"],
         "mass_candidate_sha256": mass_candidate_sha256,
+        "calibration_run_sha256": calibration_provenance[
+            "calibration_run_sha256"
+        ],
+        "calibration_summary_sha256": calibration_provenance[
+            "calibration_summary_sha256"
+        ],
+        "calibration_artifact_inventory_sha256": calibration_provenance[
+            "artifact_inventory_sha256"
+        ],
+        "calibration_corpus_gcs_inventory_sha256": calibration_provenance[
+            "corpus_gcs_inventory_sha256"
+        ],
+        "mass_min_coverage": MASS_COVERAGE_BY_EXPERTS[retained_experts],
+        "calibration_observed_input_tokens": observed_input_tokens,
+        "calibration_minimum_observed_input_tokens": minimum_input_tokens,
+        "calibration_full_usable_records": full_usable_records,
+        "calibration_processed_records": processed_records,
         "reconstruction_run_sha256": reconstruction_run_sha256,
         "reconstruction_summary_sha256": reconstruction_summary_sha256,
         "mass_gate_satisfied": True,
@@ -235,6 +529,23 @@ def _write_immutable(path: Any, payload: Mapping[str, Any]) -> None:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(encoded)
+
+
+def _broadcast_process0_error(
+    multihost_utils: Any, np: Any, message: str | None, *, limit: int = 16_384
+) -> str | None:
+    """Broadcast a caught process-0 finalization failure to every host."""
+    encoded = (message or "").encode("utf-8")
+    if len(encoded) >= limit:
+        encoded = encoded[: limit - 1]
+    payload = np.zeros((limit,), np.uint8)
+    if encoded:
+        payload[: len(encoded)] = np.frombuffer(encoded, np.uint8)
+    received = np.asarray(multihost_utils.broadcast_one_to_all(payload))
+    decoded = bytes(received.tolist()).split(b"\0", 1)[0].decode(
+        "utf-8", errors="replace"
+    )
+    return decoded or None
 
 
 def _validate_selection(
@@ -295,12 +606,24 @@ def _ffw_parameter_tree(layer_tree: Mapping[str, Any], *, use_post_norm: bool):
     return {name: layer_tree[name] for name in sorted(names)}
 
 
-def _load_artifact(path: Any, *, np: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+def _load_artifact(
+    path: Any,
+    *,
+    np: Any,
+    run_id: str,
+    calibration_run_sha256: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     metadata = json.loads(path.read_text())
     if metadata.get("schema_version") != 1 or set(metadata.get("fields", {})) != set(
         _FIELDS
     ):
         raise ValueError(f"invalid reconstruction manifest {path}")
+    if (
+        metadata.get("run_id") != run_id
+        or metadata.get("calibration_run_sha256") != calibration_run_sha256
+        or metadata.get("artifact_id") != path.stem
+    ):
+        raise ValueError(f"reconstruction manifest lineage differs at {path}")
     bucket = metadata.get("bucket")
     if bucket not in RECONSTRUCTION_BUCKETS:
         raise ValueError(f"unknown reconstruction bucket {bucket!r} at {path}")
@@ -393,6 +716,34 @@ def run_reconstruction_gate(
 ) -> dict[str, Any]:
     if not _RUN_ID.fullmatch(run_id):
         raise ValueError("invalid reconstruction run ID")
+    canonical = {
+        "maximum relative RMSE": (
+            max_relative_rmse,
+            RECONSTRUCTION_MAX_RELATIVE_RMSE,
+        ),
+        "minimum cosine similarity": (
+            min_cosine_similarity,
+            RECONSTRUCTION_MIN_COSINE_SIMILARITY,
+        ),
+        "minimum total reconstruction tokens": (
+            min_total_tokens,
+            RECONSTRUCTION_SAMPLE_TOKENS,
+        ),
+        "minimum reconstruction tokens per bucket": (
+            min_tokens_per_bucket,
+            RECONSTRUCTION_MIN_TOKENS_PER_BUCKET,
+        ),
+    }
+    changed = [
+        f"{name}={actual!r} (required {expected!r})"
+        for name, (actual, expected) in canonical.items()
+        if actual != expected
+    ]
+    if changed:
+        raise ValueError(
+            "Stage-1 reconstruction thresholds are canonical and non-overridable: "
+            + "; ".join(changed)
+        )
     require_launcher_run_id(run_id)
     # Refuse Stage-1 continuation from a missing/edited readiness receipt before
     # distributed JAX can initialize a backend.
@@ -403,8 +754,77 @@ def run_reconstruction_gate(
     calibration_root = epath.Path(calibration_dir)
     raw_root = epath.Path(raw_dir)
     candidate_file = epath.Path(candidate_path)
-    calibration_identity = json.loads(
-        (calibration_root / "calibration-run.json").read_text()
+    calibration_identity_file = calibration_root / "calibration-run.json"
+    calibration_summary_file = calibration_root / "summary.json"
+    calibration_identity_bytes = calibration_identity_file.read_bytes()
+    calibration_summary_bytes = calibration_summary_file.read_bytes()
+    mass_candidate_bytes = candidate_file.read_bytes()
+    calibration_identity = json.loads(calibration_identity_bytes)
+    calibration_summary = json.loads(calibration_summary_bytes)
+    mass_candidate = json.loads(mass_candidate_bytes)
+    if calibration_identity.get("source_checkpoint") != source_checkpoint:
+        raise ValueError("source checkpoint differs from calibration identity")
+    if normalize_source_identity(calibration_identity.get("sunfish_source")) != (
+        normalize_source_identity(current_source_identity)
+    ):
+        raise ValueError("reconstruction source tree differs from calibration")
+    if calibration_summary.get("raw_artifact_prefix") != str(raw_root):
+        raise ValueError("raw reconstruction artifacts differ from calibration summary")
+    candidate_sha256 = hashlib.sha256(mass_candidate_bytes).hexdigest()
+    calibration_identity_sha256 = hashlib.sha256(
+        calibration_identity_bytes
+    ).hexdigest()
+    calibration_summary_sha256 = hashlib.sha256(
+        calibration_summary_bytes
+    ).hexdigest()
+    calibration_provenance = validate_calibration_for_reconstruction(
+        calibration_identity,
+        calibration_summary,
+        mass_candidate,
+        calibration_run_sha256=calibration_identity_sha256,
+        calibration_summary_sha256=calibration_summary_sha256,
+        mass_candidate_sha256=candidate_sha256,
+        mass_candidate_path=str(candidate_file),
+    )
+    artifact_inventory_file = (
+        calibration_root / "reconstruction-artifact-inventory.json"
+    )
+    if calibration_summary.get("artifact_inventory") != str(
+        artifact_inventory_file
+    ):
+        raise ValueError("calibration summary artifact inventory path differs")
+    expected_artifact_inventory_sha256 = calibration_summary.get(
+        "artifact_inventory_sha256"
+    )
+    if not isinstance(expected_artifact_inventory_sha256, str) or not _SHA256.fullmatch(
+        expected_artifact_inventory_sha256
+    ):
+        raise ValueError("calibration summary has no artifact inventory digest")
+    artifact_inventory_bytes = artifact_inventory_file.read_bytes()
+    if (
+        hashlib.sha256(artifact_inventory_bytes).hexdigest()
+        != expected_artifact_inventory_sha256
+    ):
+        raise ValueError("calibration artifact inventory bytes changed")
+    artifact_inventory = validate_artifact_inventory(
+        json.loads(artifact_inventory_bytes),
+        root=raw_root,
+        run_id=calibration_identity["run_id"],
+        calibration_run_sha256=calibration_identity_sha256,
+        expected_processes=int(calibration_identity["topology"]["processes"]),
+        allowed_buckets=RECONSTRUCTION_BUCKETS,
+        field_names=_FIELDS,
+    )
+    if (
+        artifact_inventory.get("total_tokens")
+        != calibration_summary.get("artifact_tokens")
+        or artifact_inventory.get("tokens_by_bucket")
+        != calibration_summary.get("artifact_tokens_by_bucket")
+    ):
+        raise ValueError("calibration artifact inventory counts differ from summary")
+    verify_live_artifact_inventory(raw_root, artifact_inventory)
+    calibration_provenance["artifact_inventory_sha256"] = (
+        expected_artifact_inventory_sha256
     )
     readiness_ledger_path = calibration_identity.get("readiness_ledger")
     readiness_ledger_sha256 = calibration_identity.get(
@@ -468,14 +888,11 @@ def run_reconstruction_gate(
     shardings = make_teacher_mesh_and_shardings(jax, np)
     mesh = shardings["mesh"]
     root = epath.Path(output_dir) / run_id
-    mass_candidate = json.loads(candidate_file.read_text())
     selection, retained_experts = _validate_selection(mass_candidate)
     if not mass_candidate.get("mass_gate_satisfied"):
         raise ValueError("router-mass candidate failed; reconstruction is not authorized")
     if mass_candidate.get("promotion_allowed"):
         raise ValueError("input mass candidate is already promotable")
-    if calibration_identity.get("source_checkpoint") != source_checkpoint:
-        raise ValueError("source checkpoint differs from calibration identity")
     source_inventory = calibration_identity.get("source_gcs_inventory")
     if not isinstance(source_inventory, Mapping):
         raise ValueError("calibration identity has no teacher GCS inventory")
@@ -495,14 +912,6 @@ def run_reconstruction_gate(
     ):
         raise ValueError("candidate source tree differs from calibration identity")
 
-    candidate_sha256 = _path_sha256(candidate_file)
-    calibration_identity_sha256 = _path_sha256(
-        calibration_root / "calibration-run.json"
-    )
-    if normalize_source_identity(calibration_identity.get("sunfish_source")) != (
-        normalize_source_identity(current_source_identity)
-    ):
-        raise ValueError("reconstruction source tree differs from calibration")
     identity = {
         "schema_version": 1,
         "run_id": run_id,
@@ -510,6 +919,24 @@ def run_reconstruction_gate(
         "source_revision": calibration_identity["source_revision"],
         "calibration_run_id": calibration_identity["run_id"],
         "calibration_identity_sha256": calibration_identity_sha256,
+        "calibration_summary": str(calibration_summary_file),
+        "calibration_summary_sha256": calibration_summary_sha256,
+        "calibration_artifact_inventory": str(artifact_inventory_file),
+        "calibration_artifact_inventory_sha256": (
+            expected_artifact_inventory_sha256
+        ),
+        "calibration_corpus_gcs_inventory_sha256": calibration_provenance[
+            "corpus_gcs_inventory_sha256"
+        ],
+        "calibration_observed_input_tokens": calibration_provenance[
+            "observed_input_tokens"
+        ],
+        "calibration_minimum_observed_input_tokens": calibration_provenance[
+            "minimum_observed_input_tokens"
+        ],
+        "calibration_full_usable_records": calibration_provenance[
+            "full_usable_records"
+        ],
         "readiness_ledger": readiness_ledger_path,
         "readiness_ledger_sha256": readiness_ledger_sha256,
         "mass_candidate": candidate_path,
@@ -714,9 +1141,7 @@ def run_reconstruction_gate(
         )
 
     process_index = int(jax.process_index())
-    local_paths = sorted(
-        (raw_root / f"host-{process_index:05d}").glob("step-*.json")
-    )
+    local_paths = paths_for_process(raw_root, artifact_inventory, process_index)
     manifest_counts = np.asarray(
         multihost_utils.process_allgather(np.asarray(len(local_paths), np.int32))
     ).reshape(-1)
@@ -731,7 +1156,10 @@ def run_reconstruction_gate(
         for artifact_index in range(max_manifests):
             if artifact_index < len(local_paths):
                 metadata, arrays = _load_artifact(
-                    local_paths[artifact_index], np=np
+                    local_paths[artifact_index],
+                    np=np,
+                    run_id=calibration_identity["run_id"],
+                    calibration_run_sha256=calibration_identity_sha256,
                 )
                 local_count = int(metadata["tokens"])
                 local_bucket = RECONSTRUCTION_BUCKETS.index(metadata["bucket"])
@@ -811,8 +1239,7 @@ def run_reconstruction_gate(
     _write_immutable(root / f"host-{process_index:05d}.json", host_evidence)
     multihost_utils.sync_global_devices(f"sunfish-reconstruction-hosts-{run_id}")
 
-    summary = None
-    if process_index == 0:
+    def finalize_reconstruction():
         reconstruction = summarize_reconstruction(
             np.asarray(metric_sums).tolist(),
             np.asarray(token_counts).tolist(),
@@ -826,6 +1253,7 @@ def run_reconstruction_gate(
             "schema_version": 1,
             "run_id": run_id,
             **reconstruction,
+            "calibration_provenance": dict(calibration_provenance),
             "source_tree": source_signature,
             "candidate_tree": candidate_signature,
             "pruning": pruning,
@@ -846,8 +1274,25 @@ def run_reconstruction_gate(
                 mass_candidate_sha256=candidate_sha256,
                 reconstruction_run_sha256=run_sha256,
                 reconstruction_summary_sha256=summary_sha256,
+                calibration_provenance=calibration_provenance,
             )
             _write_immutable(calibration_root / "selection-approved.json", approved)
+        return summary
+
+    summary = None
+    finalization_error = None
+    if process_index == 0:
+        try:
+            summary = finalize_reconstruction()
+        except Exception as error:  # propagate instead of stranding peer collectives
+            finalization_error = f"{type(error).__name__}: {error}"
+    finalization_error = _broadcast_process0_error(
+        multihost_utils, np, finalization_error
+    )
+    if finalization_error is not None:
+        raise RuntimeError(
+            "reconstruction process-0 finalization failed: " + finalization_error
+        )
     multihost_utils.sync_global_devices(f"sunfish-reconstruction-summary-{run_id}")
     return summary if summary is not None else host_evidence
 

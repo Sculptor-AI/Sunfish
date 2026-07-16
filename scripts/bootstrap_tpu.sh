@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PYTHON_BIN="${PYTHON_BIN:-python3.12}"
 VENV_DIR="${VENV_DIR:-.venv-tpu}"
 ENVIRONMENT_RECORD="${ENVIRONMENT_RECORD:-tpu-environment.txt}"
 API_AUDIT_RECORD="${API_AUDIT_RECORD:-tpu-runtime-api-audit.json}"
@@ -10,6 +9,8 @@ API_AUDIT_RECORD="${API_AUDIT_RECORD:-tpu-runtime-api-audit.json}"
 : "${SUNFISH_OFFLINE_BUNDLE_ROOT:?set SUNFISH_OFFLINE_BUNDLE_ROOT to the IAP-deployed bundle root}"
 : "${SUNFISH_GIT_COMMIT:?bootstrap must run through the all-worker launcher}"
 : "${SUNFISH_SOURCE_TREE_SHA256:?bootstrap must run through the all-worker launcher}"
+PYTHON_BIN="${PYTHON_BIN:-${SUNFISH_OFFLINE_BUNDLE_ROOT}/python/bin/python3}"
+STOCK_PYTHON_BIN="${SUNFISH_STOCK_PYTHON_BIN:-python3}"
 [[ "${SUNFISH_TPU_WORKER:-}" == 1 ]] || {
   echo "TPU bootstrap must run through tpu_host_entrypoint.sh" >&2
   exit 2
@@ -23,10 +24,14 @@ API_AUDIT_RECORD="${API_AUDIT_RECORD:-tpu-runtime-api-audit.json}"
   exit 2
 }
 
+PYTHONPATH=src "${STOCK_PYTHON_BIN}" -m sunfish_tpu.standalone_runtime verify-installed \
+  --bundle-root "${SUNFISH_OFFLINE_BUNDLE_ROOT}" \
+  --require-bundle-manifest
 PYTHONPATH=src "${PYTHON_BIN}" -m sunfish_tpu.offline_bundle verify \
   --bundle-root "${SUNFISH_OFFLINE_BUNDLE_ROOT}" \
   --expected-commit "${SUNFISH_GIT_COMMIT}" \
-  --expected-tree "${SUNFISH_SOURCE_TREE_SHA256}"
+  --expected-tree "${SUNFISH_SOURCE_TREE_SHA256}" \
+  --require-worker-runtime
 complete_marker="${VENV_DIR}/.sunfish-offline-complete"
 building_marker="${VENV_DIR}/.sunfish-offline-building"
 if [[ -e "${VENV_DIR}" && (! -d "${VENV_DIR}" || -L "${VENV_DIR}") ]]; then

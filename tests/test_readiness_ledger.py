@@ -6,7 +6,10 @@ import unittest
 from sunfish_tpu.parity_evidence import validate_stage0_parity_payload
 from sunfish_tpu.checkpoint_smoke import verify_checkpoint_evidence
 from sunfish_tpu.input_smoke import verify_evidence as verify_input_evidence
-from sunfish_tpu.real_resume_smoke import verify_real_resume_evidence
+from sunfish_tpu.real_resume_smoke import (
+    verify_real_resume_evidence,
+    verify_real_resume_prepare_evidence,
+)
 from sunfish_tpu.readiness_ledger import (
     validate_readiness_unlock,
     verify_readiness_ledger,
@@ -20,7 +23,10 @@ from sunfish_tpu.training.dependencies import (
 )
 from tests.test_input_smoke import host as input_host
 from tests.test_parity_evidence import valid_parity_payload
-from tests.test_real_resume_smoke import host as real_resume_host
+from tests.test_real_resume_smoke import (
+    host as real_resume_host,
+    prepare_host as real_resume_prepare_host,
+)
 from tests.test_seed_load_smoke import host as seed_load_host
 from tests.test_topology_smoke import host as topology_host
 
@@ -116,7 +122,28 @@ def fixtures():
         expected_processes=2,
         expected_local_devices=4,
     )
-    real_hosts = [real_resume_host(0), real_resume_host(1)]
+    real_prepare_hosts = [real_resume_prepare_host(0), real_resume_prepare_host(1)]
+    for item in real_prepare_hosts:
+        item.update(
+            {
+                "run_id": "real-resume",
+                "config_sha256": "e" * 64,
+                "config_file_sha256": "7" * 64,
+                "dataset_manifest_sha256": "b" * 64,
+                "seed_manifest_sha256": "c" * 64,
+                "sunfish_source": source,
+            }
+        )
+    real_prepare_summary = verify_real_resume_prepare_evidence(
+        real_prepare_hosts,
+        expected_devices=8,
+        expected_processes=2,
+        expected_local_devices=4,
+    )
+    real_hosts = [
+        real_resume_host(0, real_prepare_summary),
+        real_resume_host(1, real_prepare_summary),
+    ]
     for item in real_hosts:
         item.update(
             {
@@ -130,6 +157,7 @@ def fixtures():
         )
     real_resume_summary = verify_real_resume_evidence(
         real_hosts,
+        prepare_summary=real_prepare_summary,
         expected_devices=8,
         expected_processes=2,
         expected_local_devices=4,
@@ -158,6 +186,7 @@ def fixtures():
             "processes": 2,
             "local_devices": 4,
         },
+        "readiness_global_batch_size": 8,
         "stage0_parity": {
             "filename": "stage0-parity-report.json",
             **parity_summary,
@@ -209,6 +238,9 @@ def fixtures():
                     "max_gradient_norm": 1.0,
                     "max_update_norm": 0.1,
                     "required_relative_loss_reduction": 0.10,
+                    "max_peak_hbm_fraction": 0.80,
+                    "max_allowed_peak_hbm_fraction": 0.90,
+                    "local_device_count": 4,
                 },
                 "8": {
                     "passed": True,
@@ -217,6 +249,8 @@ def fixtures():
                     "p95_input_wait_ratio": 0.05,
                     "max_p95_input_wait_ratio": 0.10,
                     "local_cache_policy": "none-direct-gcs-range-reads",
+                    "memory_prefetch_policy": "grain-mp-prefetch-bounded",
+                    "per_worker_prefetch_batches": 2,
                 },
             },
             "errors": [],
@@ -231,6 +265,14 @@ def fixtures():
             "automatic_same_workdir_restore": True,
             "resume_continued_from_checkpoint": True,
             "fresh_start_metric_absent": True,
+            "exact_recorded_processes_interrupted": True,
+            "interrupt_process_policy": (
+                "pre-signal-exact-root-and-descendant-snapshot-with-pidfd"
+            ),
+            "preempted_launch_exit_policy": "signal-status-only-137-or-143",
+            "same_attempt_descendants_absent": True,
+            "owner_intervention_required": False,
+            "interrupt_timeout_seconds": 120,
             "manual_gcs_cleanup_performed": False,
             "train_complete_found": True,
             "final_checkpoint_found": True,
@@ -238,6 +280,7 @@ def fixtures():
             "resumed_launch_returncode": 0,
             "preempted_output_sha256": "4" * 64,
             "resumed_output_sha256": "5" * 64,
+            "interrupt_output_sha256": "6" * 64,
             "plan": {
                 "run_id": "preemption",
                 "workdir": "gs://bucket/runs/preemption",
@@ -346,6 +389,16 @@ class ReadinessLedgerTests(unittest.TestCase):
         self.assertFalse(ledger["passed"])
         self.assertFalse(ledger["ordered_gates"]["6"]["passed"])
 
+    def test_gate_six_recomputes_embedded_prepare_evidence(self):
+        evidence = copy.deepcopy(fixtures())
+        evidence["real_resume"]["prepare_summary"]["passed"] = False
+        ledger = verify(evidence)
+        self.assertFalse(ledger["passed"])
+        self.assertFalse(ledger["ordered_gates"]["6"]["passed"])
+        self.assertTrue(
+            any("real_resume summary" in error for error in ledger["errors"])
+        )
+
     def test_wrong_preemption_identity_or_seed_fails_lineage(self):
         evidence = copy.deepcopy(fixtures())
         evidence["preemption_run_identity"]["dataset_manifest_sha256"] = "e" * 64
@@ -356,6 +409,20 @@ class ReadinessLedgerTests(unittest.TestCase):
             any("gate-7 identity" in error for error in ledger["errors"])
         )
         self.assertTrue(any("gate-3 seed" in error for error in ledger["errors"]))
+
+    def test_gate_seven_rejects_surviving_same_attempt_descendants(self):
+        evidence = copy.deepcopy(fixtures())
+        evidence["preemption"]["same_attempt_descendants_absent"] = False
+        ledger = verify(evidence)
+        self.assertFalse(ledger["passed"])
+        self.assertFalse(ledger["ordered_gates"]["7"]["passed"])
+
+    def test_gate_seven_rejects_cleanup_hard_stop_as_interruption_evidence(self):
+        evidence = copy.deepcopy(fixtures())
+        evidence["preemption"]["preempted_launch_returncode"] = 126
+        ledger = verify(evidence)
+        self.assertFalse(ledger["passed"])
+        self.assertFalse(ledger["ordered_gates"]["7"]["passed"])
 
     def test_smoke_summary_from_another_run_cannot_pass(self):
         evidence = copy.deepcopy(fixtures())
@@ -380,6 +447,15 @@ class ReadinessLedgerTests(unittest.TestCase):
         ledger = verify(evidence)
         self.assertFalse(ledger["passed"])
         self.assertTrue(any("resume-smoke.toml" in error for error in ledger["errors"]))
+
+    def test_readiness_batch_must_stay_one_example_per_device(self):
+        evidence = copy.deepcopy(fixtures())
+        evidence["config_bundle"]["readiness_global_batch_size"] = 16
+        ledger = verify(evidence)
+        self.assertFalse(ledger["passed"])
+        self.assertTrue(
+            any("one example per global device" in error for error in ledger["errors"])
+        )
 
     def test_top_level_pass_cannot_hide_failed_host_evidence(self):
         evidence = copy.deepcopy(fixtures())

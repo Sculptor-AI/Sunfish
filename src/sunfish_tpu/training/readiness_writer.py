@@ -17,9 +17,53 @@ import jax
 from kauldron.train import metric_writer
 import numpy as np
 
-from sunfish_tpu.training.data import consume_input_wait_metrics
+from sunfish_tpu.training.data import (
+    GRAIN_PREFETCH_BATCHES_PER_WORKER,
+    consume_input_wait_metrics,
+)
 
 _ATTEMPT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def _local_device_memory_snapshot() -> dict[str, Any]:
+    devices = []
+    for local_index, device in enumerate(jax.local_devices()):
+        stats = device.memory_stats()
+        if not isinstance(stats, Mapping):
+            raise RuntimeError(
+                f"local device {local_index} did not expose TPU memory_stats"
+            )
+        values = {}
+        for name in ("bytes_in_use", "peak_bytes_in_use", "bytes_limit"):
+            value = stats.get(name)
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+                raise RuntimeError(
+                    f"local device {local_index} has invalid memory_stats[{name!r}]"
+                )
+            values[name] = int(value)
+        if not (
+            0 <= values["bytes_in_use"] <= values["peak_bytes_in_use"]
+            <= values["bytes_limit"]
+            and values["bytes_limit"] > 0
+        ):
+            raise RuntimeError(
+                f"local device {local_index} reported inconsistent TPU memory_stats"
+            )
+        devices.append(
+            {
+                "local_device_index": local_index,
+                "device_id": int(device.id),
+                "platform": str(device.platform),
+                **values,
+            }
+        )
+    if not devices:
+        raise RuntimeError("readiness evidence found no local TPU devices")
+    return {
+        "schema_version": 1,
+        "purpose": "cloud-tpu-device-memory-snapshot",
+        "devices": devices,
+    }
 
 
 def _json_scalar(value: Any) -> int | float | bool:
@@ -131,6 +175,11 @@ class ReadinessMetricWriter(metric_writer.KDMetricWriter):
                         "input_wait": consume_input_wait_metrics(),
                         "local_cache_policy": "none-direct-gcs-range-reads",
                         "local_cache_bytes": 0,
+                        "memory_prefetch_policy": "grain-mp-prefetch-bounded",
+                        "per_worker_prefetch_batches": (
+                            GRAIN_PREFETCH_BATCHES_PER_WORKER
+                        ),
+                        "device_memory": _local_device_memory_snapshot(),
                     },
                 )
             return super().write_step_metrics(

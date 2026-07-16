@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import urllib.request
 import zipfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -29,8 +30,9 @@ from sunfish_tpu.training.dependencies import (
     RUNTIME_VERSIONS,
     TPU_ONLY_RUNTIME_VERSIONS,
 )
+from sunfish_tpu import standalone_runtime
 
-BUNDLE_SCHEMA_VERSION = 1
+BUNDLE_SCHEMA_VERSION = 3
 BUNDLE_KIND = "sunfish-tpu-offline-bundle"
 BUNDLE_DIRECTORY_NAME = "sunfish-tpu-offline"
 BUNDLE_MANIFEST_NAME = "offline-bundle.json"
@@ -42,11 +44,146 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _DIST_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.!+_-]*$")
 _NORMALIZE_NAME = re.compile(r"[-_.]+")
+_MANYLINUX_TAG = re.compile(r"^manylinux_(\d+)_(\d+)_x86_64$")
+_GLIBC_VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+)+$")
 _BOOTSTRAP_DISTRIBUTIONS = {"pip", "setuptools"}
+_LEGACY_MANYLINUX_GLIBC = {
+    "manylinux1_x86_64": (2, 5),
+    "manylinux2010_x86_64": (2, 12),
+    "manylinux2014_x86_64": (2, 17),
+}
+_WORKER_PROXY_VARIABLES = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
 
 
 def normalize_distribution_name(name: str) -> str:
     return _NORMALIZE_NAME.sub("-", name).lower()
+
+
+def _version_tuple(value: str) -> tuple[int, ...]:
+    if not _GLIBC_VERSION.fullmatch(value):
+        raise ValueError(f"invalid glibc version: {value!r}")
+    return tuple(int(part) for part in value.split("."))
+
+
+def _format_version(value: Sequence[int]) -> str:
+    return ".".join(str(part) for part in value)
+
+
+def _wheel_minimum_glibc(path: Path) -> tuple[int, ...] | None:
+    """Return the least glibc version admitted by one wheel's platform tags."""
+    if path.suffix != ".whl":
+        raise ValueError(f"not a wheel: {path.name}")
+    try:
+        platform_tags = path.name[:-4].rsplit("-", 3)[3].split(".")
+    except IndexError as error:
+        raise ValueError(f"invalid wheel filename: {path.name}") from error
+    if "any" in platform_tags:
+        return None
+    requirements: list[tuple[int, ...]] = []
+    for tag in platform_tags:
+        if tag in _LEGACY_MANYLINUX_GLIBC:
+            requirements.append(_LEGACY_MANYLINUX_GLIBC[tag])
+            continue
+        match = _MANYLINUX_TAG.fullmatch(tag)
+        if match is not None:
+            requirements.append((int(match.group(1)), int(match.group(2))))
+    if not requirements:
+        raise ValueError(
+            "native wheel has no versioned manylinux x86_64 compatibility tag: "
+            f"{path.name}"
+        )
+    # A wheel with several platform tags is usable when any one tag matches.
+    return min(requirements)
+
+
+def minimum_glibc_for_wheels(wheels: Sequence[Path]) -> str:
+    """Compute the worker glibc floor encoded by the complete wheel set."""
+    minimum = (2, 17)
+    for wheel in wheels:
+        requirement = _wheel_minimum_glibc(wheel)
+        if requirement is not None:
+            minimum = max(minimum, requirement)
+    return _format_version(minimum)
+
+
+def verify_worker_runtime_compatibility(
+    manifest: Mapping[str, Any],
+    *,
+    system: str | None = None,
+    machine: str | None = None,
+    python_version: str | None = None,
+    libc: tuple[str, str] | None = None,
+    environment: Mapping[str, str] | None = None,
+    discovered_proxies: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Fail closed when the current worker cannot run the immutable bundle."""
+    system = platform.system() if system is None else system
+    machine = platform.machine() if machine is None else machine
+    python_version = platform.python_version() if python_version is None else python_version
+    libc = platform.libc_ver() if libc is None else libc
+    environment = os.environ if environment is None else environment
+    discovered_proxies = (
+        urllib.request.getproxies()
+        if discovered_proxies is None
+        else discovered_proxies
+    )
+    target = manifest.get("target")
+    if not isinstance(target, Mapping):
+        raise ValueError("offline bundle target is missing")
+    minimum_glibc = target.get("minimum_glibc")
+    if not isinstance(minimum_glibc, str):
+        raise ValueError("offline bundle glibc floor is missing")
+    active_environment = {
+        name: environment[name]
+        for name in _WORKER_PROXY_VARIABLES
+        if environment.get(name)
+    }
+    active_discovered = {
+        str(name): value
+        for name, value in discovered_proxies.items()
+        if str(name).lower() in {"http", "https", "all"} and value
+    }
+    if active_environment or active_discovered:
+        names = sorted({*active_environment, *active_discovered})
+        raise ValueError(
+            "worker HTTP(S)/ALL proxy settings are forbidden before JAX startup: "
+            + ", ".join(names)
+        )
+    if system != "Linux" or machine.lower() not in {"x86_64", "amd64"}:
+        raise ValueError(
+            f"worker platform is incompatible with bundle: {system}/{machine}"
+        )
+    if python_version != standalone_runtime.RUNTIME_PYTHON_VERSION:
+        raise ValueError(
+            f"worker Python {python_version} differs from required Python "
+            f"{standalone_runtime.RUNTIME_PYTHON_VERSION}"
+        )
+    if libc[0].lower() != "glibc" or not libc[1]:
+        raise ValueError(f"worker does not report glibc: {libc!r}")
+    observed_glibc = _version_tuple(libc[1])
+    required_glibc = _version_tuple(minimum_glibc)
+    width = max(len(observed_glibc), len(required_glibc))
+    if observed_glibc + (0,) * (width - len(observed_glibc)) < required_glibc + (
+        0,
+    ) * (width - len(required_glibc)):
+        raise ValueError(
+            f"worker glibc {libc[1]} is older than bundle floor {minimum_glibc}"
+        )
+    return {
+        "operating_system": "linux",
+        "machine": "x86_64",
+        "python": python_version,
+        "glibc": libc[1],
+        "minimum_glibc": minimum_glibc,
+        "proxy_environment_clear": True,
+    }
 
 
 def _sha256_file(path: Path) -> str:
@@ -186,12 +323,20 @@ def write_resolved_lock(python: Path, output: Path) -> dict[str, str]:
     }
     if not observed:
         raise RuntimeError("validation environment contains no runtime distributions")
+    if "requests" not in observed:
+        raise RuntimeError(
+            "resolved TPU runtime is missing requests required by jax[tpu] "
+            "distributed initialization"
+        )
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(
         "# Generated and offline-validated by build_tpu_offline_bundle.sh.\n"
         + "".join(f"{name}=={version}\n" for name, version in observed.items()),
         encoding="utf-8",
     )
+    resolved = parse_resolved_lock(output)
+    if resolved.get("requests") != observed["requests"]:
+        raise RuntimeError("resolved TPU lock did not preserve exactly one requests pin")
     return observed
 
 
@@ -287,6 +432,7 @@ def create_bundle_manifest(bundle_root: Path) -> dict[str, Any]:
     wheelhouse = bundle_root / WHEELHOUSE_NAME
     identity = workspace_source_identity(source_root)
     distributions = parse_resolved_lock(lock_path)
+    python_runtime = standalone_runtime.verify_runtime_artifacts(bundle_root)
 
     expected_direct = {
         normalize_distribution_name(name): version
@@ -312,6 +458,8 @@ def create_bundle_manifest(bundle_root: Path) -> dict[str, Any]:
     relative_files = [
         f"source/{RELEASE_MANIFEST_NAME}",
         RESOLVED_LOCK_NAME,
+        standalone_runtime.RUNTIME_METADATA_NAME,
+        python_runtime["archive"],
         *(f"{WHEELHOUSE_NAME}/{path.name}" for path in wheels),
     ]
     payload = {
@@ -322,7 +470,8 @@ def create_bundle_manifest(bundle_root: Path) -> dict[str, Any]:
         "target": {
             "operating_system": "linux",
             "machine": "x86_64",
-            "python": "3.12",
+            "python": standalone_runtime.RUNTIME_PYTHON_VERSION,
+            "minimum_glibc": minimum_glibc_for_wheels(wheels),
         },
         "builder": {
             "operating_system": platform.system().lower(),
@@ -331,9 +480,10 @@ def create_bundle_manifest(bundle_root: Path) -> dict[str, Any]:
                 if platform.machine().lower() in {"x86_64", "amd64"}
                 else platform.machine().lower()
             ),
-            "python": f"{sys.version_info.major}.{sys.version_info.minor}",
+            "python": platform.python_version(),
             "libc": list(platform.libc_ver()),
         },
+        "python_runtime": python_runtime,
         "sunfish_source": identity,
         "gemma_source_commit": GEMMA_SOURCE_COMMIT,
         "resolved_distributions": distributions,
@@ -359,6 +509,7 @@ def verify_bundle(
     expected_commit: str | None = None,
     expected_tree: str | None = None,
     verify_file_hashes: bool = True,
+    require_worker_runtime: bool = False,
 ) -> dict[str, Any]:
     bundle_root = bundle_root.resolve()
     manifest = _load_manifest(bundle_root / BUNDLE_MANIFEST_NAME)
@@ -370,18 +521,22 @@ def verify_bundle(
         raise ValueError("offline bundle does not forbid worker egress")
     if manifest.get("transport_policy") != "gcloud-alpha-tpu-vm-iap-all-workers":
         raise ValueError("offline bundle does not require all-worker IAP transport")
-    if manifest.get("target") != {
-        "operating_system": "linux",
-        "machine": "x86_64",
-        "python": "3.12",
-    }:
+    target = manifest.get("target")
+    if (
+        not isinstance(target, Mapping)
+        or target.get("operating_system") != "linux"
+        or target.get("machine") != "x86_64"
+        or target.get("python") != standalone_runtime.RUNTIME_PYTHON_VERSION
+        or not isinstance(target.get("minimum_glibc"), str)
+    ):
         raise ValueError("offline bundle target differs from TPU worker contract")
+    _version_tuple(target["minimum_glibc"])
     builder = manifest.get("builder")
     if (
         not isinstance(builder, Mapping)
         or builder.get("operating_system") != "linux"
         or builder.get("machine") != "x86_64"
-        or builder.get("python") != "3.12"
+        or builder.get("python") != standalone_runtime.RUNTIME_PYTHON_VERSION
         or not isinstance(builder.get("libc"), list)
         or len(builder["libc"]) != 2
         or any(not isinstance(item, str) for item in builder["libc"])
@@ -414,9 +569,13 @@ def verify_bundle(
         for path in wheel_entries
     }
     _verify_wheelhouse_matches_lock(wheel_entries, lock)
+    if target["minimum_glibc"] != minimum_glibc_for_wheels(wheel_entries):
+        raise ValueError("offline bundle glibc floor differs from wheel tags")
     expected_paths = {
         f"source/{RELEASE_MANIFEST_NAME}",
         RESOLVED_LOCK_NAME,
+        standalone_runtime.RUNTIME_METADATA_NAME,
+        standalone_runtime.expected_runtime_metadata()["archive"],
         *wheel_paths,
     }
     records = manifest.get("files")
@@ -448,6 +607,11 @@ def verify_bundle(
         observed_paths.add(relative)
     if observed_paths != expected_paths:
         raise ValueError("offline bundle inventory/file set mismatch")
+    standalone_runtime.verify_runtime_artifacts(
+        bundle_root, require_bundle_manifest=True
+    )
+    if require_worker_runtime:
+        verify_worker_runtime_compatibility(manifest)
     return manifest
 
 
@@ -540,6 +704,7 @@ def _parser() -> argparse.ArgumentParser:
     verify.add_argument("--expected-commit")
     verify.add_argument("--expected-tree")
     verify.add_argument("--skip-file-hashes", action="store_true")
+    verify.add_argument("--require-worker-runtime", action="store_true")
 
     installed = subparsers.add_parser("verify-installed")
     installed.add_argument("--bundle-root", type=Path, required=True)
@@ -569,6 +734,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 expected_commit=args.expected_commit,
                 expected_tree=args.expected_tree,
                 verify_file_hashes=not args.skip_file_hashes,
+                require_worker_runtime=args.require_worker_runtime,
             )
         elif args.command == "verify-installed":
             result = verify_installed_environment(args.bundle_root, args.python)

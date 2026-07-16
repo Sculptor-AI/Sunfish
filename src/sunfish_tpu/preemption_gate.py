@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -20,6 +21,24 @@ from sunfish_tpu.source_identity import normalize_source_identity
 from sunfish_tpu.training.spec import HarnessConfig, Phase
 
 _ATTEMPT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_REMOTE_INTERRUPT_TIMEOUT_SECONDS = 120
+_LOCAL_GROUP_TERM_TIMEOUT_SECONDS = 30
+_LOCAL_GROUP_KILL_TIMEOUT_SECONDS = 30
+CLEANUP_HARD_STOP_RETURN_CODE = 126
+EXPECTED_PREEMPTED_LAUNCH_RETURN_CODES = frozenset(
+    (128 + signal.SIGKILL, 128 + signal.SIGTERM)
+)
+PREEMPTED_LAUNCH_EXIT_POLICY = "signal-status-only-137-or-143"
+
+
+class _ControllerSignal(RuntimeError):
+    def __init__(self, signum: int):
+        self.signum = signum
+        super().__init__(f"controller received signal {signum}")
+
+
+class OwnerInterventionRequiredError(RuntimeError):
+    """Exact worker/local cleanup is unproven; automation must stop."""
 
 
 def checkpoint_commit_marker(workdir: str, step: int) -> str:
@@ -132,6 +151,173 @@ def _upload_immutable(gcloud: str, local_path: Path, uri: str) -> None:
     )
 
 
+def _invoke_exact_remote_interrupt(
+    interrupt_command: Sequence[str],
+) -> subprocess.CompletedProcess[str]:
+    """Run the all-worker exact-PID helper with a hard controller timeout."""
+    return subprocess.run(
+        list(interrupt_command),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+        timeout=_REMOTE_INTERRUPT_TIMEOUT_SECONDS,
+    )
+
+
+def _require_expected_preempted_launch_returncode(returncode: int) -> None:
+    """Refuse a resume unless the first launcher reports a signal exit.
+
+    Status 126 is the attached launcher's explicit fail-closed contract: exact
+    remote cleanup is unproven and the allocation owner must investigate.  It
+    must never be treated as generic nonzero evidence of a successful test
+    interruption.  Other unexpected statuses likewise cannot prove that the
+    documented SIGKILL/SIGTERM path is what stopped the launch.
+    """
+    if returncode == CLEANUP_HARD_STOP_RETURN_CODE:
+        raise OwnerInterventionRequiredError(
+            "preempted launch returned cleanup hard-stop status 126; exact "
+            "remote cleanup is unproven, owner intervention is required, and "
+            "automatic resume/retry is forbidden"
+        )
+    if returncode not in EXPECTED_PREEMPTED_LAUNCH_RETURN_CODES:
+        expected = "/".join(
+            str(value) for value in sorted(EXPECTED_PREEMPTED_LAUNCH_RETURN_CODES)
+        )
+        raise RuntimeError(
+            f"preempted launch exited with {returncode}; expected signal-style "
+            f"status {expected} from the documented exact interrupt path, so "
+            "automatic resume is forbidden"
+        )
+
+
+def _process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_for_process_group_exit(process_group_id: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while _process_group_exists(process_group_id):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+    return True
+
+
+def _best_effort_interrupt_and_stop(
+    process: subprocess.Popen,
+    interrupt_command: Sequence[str],
+    *,
+    interrupt_remote: bool,
+) -> bool:
+    """Stop an abnormal launch and return whether cleanup is fully proven.
+
+    The remote helper fails closed unless every PID still belongs to the exact
+    run/attempt and ``sunfish-train`` command. It must run before terminating
+    the controller-local SSH launcher so a dropped SSH session cannot strand
+    the user-space training processes on workers.
+    """
+
+    def warn(message: str) -> None:
+        try:
+            print(f"sunfish-preemption-gate cleanup: {message}", file=sys.stderr)
+        except BaseException:
+            # Cleanup diagnostics must never replace the original gate error.
+            pass
+
+    # A failed SSH/gcloud launcher can exit while its remote child survives.
+    # Therefore remote cleanup cannot be conditional on the local process still
+    # running. Skip it only after the normal guarded interrupt returned zero.
+    remote_cleanup_proven = not interrupt_remote
+    if interrupt_remote:
+        try:
+            interrupted = _invoke_exact_remote_interrupt(interrupt_command)
+            remote_cleanup_proven = interrupted.returncode == 0
+            if not remote_cleanup_proven:
+                warn(
+                    "exact remote interrupt returned "
+                    f"{interrupted.returncode}: {interrupted.stdout.strip()}"
+                )
+        except BaseException as error:
+            warn(f"exact remote interrupt failed: {error}")
+            remote_cleanup_proven = False
+
+    try:
+        active = process.poll() is None
+    except BaseException as error:
+        warn(f"unable to re-inspect local launcher: {error}")
+        active = True
+    if not active and not interrupt_remote:
+        return remote_cleanup_proven
+
+    # ``first`` is launched with ``start_new_session=True`` below. Signal that
+    # isolated controller-local process group rather than only the Bash wrapper:
+    # launch_tpu_pod.sh owns a gcloud/SSH + tee pipeline whose children otherwise
+    # survive wrapper termination. This never broadens the worker-side signal;
+    # the remote helper above remains exact-PID and allocation-safe.
+    process_group_id = process.pid
+    if (
+        not isinstance(process_group_id, int)
+        or process_group_id <= 1
+        or process_group_id == os.getpgrp()
+    ):
+        warn(f"refusing unsafe local process-group cleanup: {process_group_id!r}")
+        return False
+
+    try:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        return remote_cleanup_proven
+    except BaseException as error:
+        warn(f"unable to terminate local launcher process group: {error}")
+        return False
+
+    try:
+        process.wait(timeout=_LOCAL_GROUP_TERM_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
+    except BaseException as error:
+        warn(f"unable to wait for local launcher: {error}")
+    try:
+        terminated = _wait_for_process_group_exit(
+            process_group_id, _LOCAL_GROUP_TERM_TIMEOUT_SECONDS
+        )
+    except BaseException as error:
+        warn(f"unable to prove local launcher exit after SIGTERM: {error}")
+        terminated = False
+    if terminated:
+        return remote_cleanup_proven
+
+    try:
+        os.killpg(process_group_id, signal.SIGKILL)
+    except ProcessLookupError:
+        return remote_cleanup_proven
+    except BaseException as error:
+        warn(f"unable to kill local launcher process group: {error}")
+        return False
+    try:
+        process.wait(timeout=_LOCAL_GROUP_KILL_TIMEOUT_SECONDS)
+    except BaseException as error:
+        warn(f"unable to reap local launcher after SIGKILL: {error}")
+    try:
+        killed = _wait_for_process_group_exit(
+            process_group_id, _LOCAL_GROUP_KILL_TIMEOUT_SECONDS
+        )
+    except BaseException as error:
+        warn(f"unable to prove local launcher exit after SIGKILL: {error}")
+        killed = False
+    if not killed:
+        warn("local launcher process group still exists after SIGKILL")
+        return False
+    return remote_cleanup_proven
+
+
 def run_preemption_gate(
     *,
     config_path: Path,
@@ -189,6 +375,13 @@ def run_preemption_gate(
                 "--attempt-id",
                 preempt_attempt,
             ],
+            "interrupt_resume_processes": [
+                str(interrupter),
+                "--run-id",
+                config.run.run_id,
+                "--attempt-id",
+                resume_attempt,
+            ],
             "resume_launch": launch_command(resume_attempt),
         },
         "controller_config": str(config_path),
@@ -213,13 +406,43 @@ def run_preemption_gate(
         )
 
     preempt_log = tempfile.TemporaryFile(mode="w+")
-    first = subprocess.Popen(
-        launch_command(preempt_attempt),
-        stdout=preempt_log,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
+    first: subprocess.Popen[str] | None = None
+    resumed_process: subprocess.Popen[str] | None = None
+    remote_interrupt_succeeded = False
+    resume_remote_cleanup_required = False
+    caught_signal: int | None = None
+    cleanup_armed = False
+    spawn_in_progress = False
+    previous_handlers: dict[int, Any] = {}
+
+    def handle_controller_signal(signum: int, _frame: Any) -> None:
+        nonlocal caught_signal
+        caught_signal = signum
+        # While Popen is inside the OS spawn path there may be a live child but
+        # no Python process object yet. Latch, then raise immediately after
+        # Popen returns and the exact cleanup path owns the child.
+        if cleanup_armed and not spawn_in_progress:
+            raise _ControllerSignal(signum)
+
+    for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        previous_handlers[signum] = signal.signal(signum, handle_controller_signal)
     try:
+        cleanup_armed = True
+        if caught_signal is not None:
+            raise _ControllerSignal(caught_signal)
+        spawn_in_progress = True
+        try:
+            first = subprocess.Popen(
+                launch_command(preempt_attempt),
+                stdout=preempt_log,
+                stderr=subprocess.STDOUT,
+                text=True,
+                start_new_session=True,
+            )
+        finally:
+            spawn_in_progress = False
+        if caught_signal is not None:
+            raise _ControllerSignal(caught_signal)
         _wait_for_uri(
             gcloud,
             plan["preempt_marker"],
@@ -228,33 +451,76 @@ def run_preemption_gate(
             process=first,
         )
         evidence["checkpoint_finalized_before_process_interrupt_at"] = _utc_now()
-        subprocess.run(evidence["commands"]["interrupt_training_processes"], check=True)
+        interrupted = _invoke_exact_remote_interrupt(
+            evidence["commands"]["interrupt_training_processes"]
+        )
+        if interrupted.returncode != 0:
+            raise subprocess.CalledProcessError(
+                interrupted.returncode,
+                evidence["commands"]["interrupt_training_processes"],
+                output=interrupted.stdout,
+            )
+        evidence["interrupt_output_sha256"] = hashlib.sha256(
+            interrupted.stdout.encode()
+        ).hexdigest()
+        evidence["exact_recorded_processes_interrupted"] = True
+        evidence["interrupt_process_policy"] = (
+            "pre-signal-exact-root-and-descendant-snapshot-with-pidfd"
+        )
+        evidence["same_attempt_descendants_absent"] = True
+        evidence["interrupt_timeout_seconds"] = _REMOTE_INTERRUPT_TIMEOUT_SECONDS
+        remote_interrupt_succeeded = True
         try:
             first_returncode = first.wait(timeout=120)
         except subprocess.TimeoutExpired as error:
             raise RuntimeError("preempted all-host launch did not exit") from error
         evidence["preempted_launch_returncode"] = first_returncode
-        if first_returncode == 0:
-            raise RuntimeError(
-                "interrupted launch exited zero; no real process interruption was observed"
-            )
+        evidence["preempted_launch_exit_policy"] = PREEMPTED_LAUNCH_EXIT_POLICY
+        try:
+            _require_expected_preempted_launch_returncode(first_returncode)
+        except RuntimeError:
+            evidence["owner_intervention_required"] = True
+            raise
+        evidence["owner_intervention_required"] = False
         if not _gcloud_exists(gcloud, plan["preempt_marker"]):
             raise RuntimeError("finalized checkpoint disappeared after preemption")
 
-        resumed = subprocess.run(
-            launch_command(resume_attempt),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
-            timeout=timeout_seconds,
-        )
-        evidence["resumed_launch_returncode"] = resumed.returncode
+        if caught_signal is not None:
+            raise _ControllerSignal(caught_signal)
+        spawn_in_progress = True
+        try:
+            resumed_process = subprocess.Popen(
+                launch_command(resume_attempt),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                start_new_session=True,
+            )
+        finally:
+            spawn_in_progress = False
+        resume_remote_cleanup_required = True
+        if caught_signal is not None:
+            raise _ControllerSignal(caught_signal)
+        try:
+            resumed_output, _ = resumed_process.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired as error:
+            raise TimeoutError("resumed all-host launch timed out") from error
+        evidence["resumed_launch_returncode"] = resumed_process.returncode
         evidence["resumed_output_sha256"] = hashlib.sha256(
-            resumed.stdout.encode()
+            resumed_output.encode()
         ).hexdigest()
-        if resumed.returncode != 0:
-            raise RuntimeError(f"resumed launch failed with {resumed.returncode}")
+        if resumed_process.returncode == CLEANUP_HARD_STOP_RETURN_CODE:
+            evidence["owner_intervention_required"] = True
+            raise OwnerInterventionRequiredError(
+                "resumed launch returned cleanup hard-stop status 126; exact "
+                "remote cleanup is unproven, owner intervention is required, "
+                "and automatic retry is forbidden"
+            )
+        if resumed_process.returncode != 0:
+            raise RuntimeError(
+                f"resumed launch failed with {resumed_process.returncode}"
+            )
+        resume_remote_cleanup_required = False
         _wait_for_uri(
             gcloud,
             plan["resume_first_metric"],
@@ -319,18 +585,62 @@ def run_preemption_gate(
             }
         )
     finally:
-        if first.poll() is None:
-            first.terminate()
+        cleanup_proven = True
+        cleanup_armed = False
+        # Once cleanup starts, a repeated terminal signal must not interrupt
+        # exact remote cleanup or local group teardown halfway through.
+        for signum in previous_handlers:
+            signal.signal(signum, signal.SIG_IGN)
+
+        def prove_cleanup(
+            process: subprocess.Popen[str],
+            command: Sequence[str],
+            *,
+            interrupt_remote: bool,
+        ) -> bool:
             try:
-                first.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                first.kill()
-                first.wait(timeout=30)
-        preempt_log.seek(0)
-        evidence["preempted_output_sha256"] = hashlib.sha256(
-            preempt_log.read().encode()
-        ).hexdigest()
-        preempt_log.close()
+                return _best_effort_interrupt_and_stop(
+                    process,
+                    command,
+                    interrupt_remote=interrupt_remote,
+                )
+            except BaseException as error:
+                try:
+                    print(
+                        "sunfish-preemption-gate cleanup proof raised: "
+                        f"{error}",
+                        file=sys.stderr,
+                    )
+                except BaseException:
+                    pass
+                return False
+
+        try:
+            if resumed_process is not None and resume_remote_cleanup_required:
+                cleanup_proven = prove_cleanup(
+                    resumed_process,
+                    evidence["commands"]["interrupt_resume_processes"],
+                    interrupt_remote=True,
+                ) and cleanup_proven
+            if first is not None:
+                cleanup_proven = prove_cleanup(
+                    first,
+                    evidence["commands"]["interrupt_training_processes"],
+                    interrupt_remote=not remote_interrupt_succeeded,
+                ) and cleanup_proven
+            preempt_log.seek(0)
+            evidence["preempted_output_sha256"] = hashlib.sha256(
+                preempt_log.read().encode()
+            ).hexdigest()
+        finally:
+            preempt_log.close()
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
+        if not cleanup_proven:
+            raise OwnerInterventionRequiredError(
+                "preemption-gate cleanup is unproven; owner intervention is "
+                "required and automatic resume/retry is forbidden"
+            )
 
     encoded = json.dumps(evidence, indent=2, sort_keys=True) + "\n"
     with tempfile.TemporaryDirectory() as temporary:
@@ -360,6 +670,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             timeout_seconds=args.timeout_seconds,
             poll_seconds=args.poll_seconds,
         )
+    except OwnerInterventionRequiredError as error:
+        print(f"sunfish-preemption-gate: {error}", file=sys.stderr)
+        return CLEANUP_HARD_STOP_RETURN_CODE
     except (
         FileExistsError,
         FileNotFoundError,

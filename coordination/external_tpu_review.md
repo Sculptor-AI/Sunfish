@@ -86,8 +86,8 @@ and the real GCS prefix can do that.
 | 3. sharded seed load | Executable: `sunfish-seed-load-smoke` restores the real 8.11B seed directly into Phase-B target shardings and records per-host/device resident bytes | Not run |
 | 4. real training smoke | Executable: strict 100–500 update Kauldron trainer plus immutable per-step loss/gradient/update evidence and 10% tiny-set overfit criterion | Not run |
 | 5. distributed checkpoint | Executable: collective Phase-B synthetic Orbax proof plus production Kauldron checkpointer | Not run |
-| 6. exact resume | Executable: `sunfish-real-resume-smoke` compares production next batch/loss/trainable gradients+updates+params/full optimizer+collections/step and frozen-base invariance | Not run |
-| 7. preemption | Executable controller waits for the pinned Orbax commit marker, signals only the exact recorded user-space training PIDs on all hosts, relaunches unchanged, and proves the new attempt's first metric continues at the saved step rather than step 0; TPU VM lifecycle is untouched | Not run |
+| 6. exact resume | Executable: `sunfish-real-resume-smoke` closes the save/control manager and process, then a second Python process rebuilds/discovers/restores and compares production next batch/loss/trainable gradients+updates+params/full optimizer+collections/step and frozen-base invariance; the ledger embeds and recomputes the first-process evidence | Not run |
+| 7. preemption | Worker exec is gated behind exclusive PID publication, so a raced PID object cannot spawn an unrecorded workload descendant. The executable controller then waits for the pinned Orbax commit marker, immutably records and exact-verifies every current-user root/descendant PID plus start time before signaling individual pidfds on all hosts, rejects any unrecorded survivor with a non-retryable owner stop, requires signal status 137/143 before resume, and maps any unproven worker or local-group cleanup to hard-stop status 126; it relaunches unchanged and proves continuation rather than step 0 without touching TPU VM lifecycle | Not run |
 | 8. input throughput | Executable: per-host iterator waits plus accelerator step time, p95 wait-ratio ≤10%, zero local cache | Not run |
 
 `sunfish-readiness-ledger` is the final fail-closed merger. It pins hashes for
@@ -124,8 +124,11 @@ PyPI or GitHub. A connected Linux packaging host builds and offline-validates
 one source/wheel archive; the controller deploys it to all workers through IAP
 SCP; worker pip is forced to `--no-index`. `scripts/tpu_iap.sh` is the sole TPU
 VM transport surface and exposes no create/start/stop/reset/delete operation.
-Gate 7 signals only exact user-space training PIDs after verifying their
-run/attempt environment and cannot mutate or power-cycle the allocation.
+Gate 7 snapshots the published roots and every current-user descendant before
+the first signal, verifies exact run/attempt, command hash, PID, parent, and
+Linux start time, then signals only those individual pidfds. An unidentified
+survivor is a non-retryable owner stop. It cannot mutate or power-cycle the
+allocation.
 
 ## Lane split
 

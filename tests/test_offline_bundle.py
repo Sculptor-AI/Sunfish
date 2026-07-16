@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 from pathlib import Path
 import shlex
@@ -12,12 +13,16 @@ import zipfile
 from sunfish.source_tree import _digest_source_names, workspace_source_identity
 from sunfish_tpu.offline_bundle import (
     create_bundle_manifest,
+    minimum_glibc_for_wheels,
     pack_bundle,
     parse_resolved_lock,
     read_archive_sidecar,
     verify_bundle,
+    verify_worker_runtime_compatibility,
+    write_resolved_lock,
 )
 from sunfish_tpu.runtime_provenance import resolve_gemma_source_commit
+from sunfish_tpu import standalone_runtime
 from sunfish_tpu.training.dependencies import (
     GEMMA_SOURCE_COMMIT,
     RUNTIME_VERSIONS,
@@ -88,11 +93,44 @@ class ExportedSourceIdentityTests(unittest.TestCase):
                 workspace_source_identity(root)
 
 
+class StandaloneRuntimePinTests(unittest.TestCase):
+    def test_exact_python_build_standalone_asset_is_pinned(self):
+        self.assertEqual(standalone_runtime.RUNTIME_RELEASE, "20260623")
+        self.assertEqual(standalone_runtime.RUNTIME_PYTHON_VERSION, "3.12.13")
+        self.assertEqual(
+            standalone_runtime.RUNTIME_ARCHIVE_NAME,
+            "cpython-3.12.13+20260623-"
+            "x86_64-unknown-linux-gnu-install_only.tar.gz",
+        )
+        self.assertEqual(
+            standalone_runtime.RUNTIME_ARCHIVE_SHA256,
+            "9fa869d69be54f6b8eeae64272fbd9bb0646e0e1a8da9d80e51ba5a3bee48930",
+        )
+        self.assertEqual(standalone_runtime.RUNTIME_ARCHIVE_SIZE, 111_146_559)
+
+
 class OfflineBundleTests(unittest.TestCase):
+    def setUp(self):
+        self.runtime_bytes = b"sunfish-standalone-runtime-fixture"
+        patcher = mock.patch.multiple(
+            standalone_runtime,
+            RUNTIME_ARCHIVE_SHA256=hashlib.sha256(self.runtime_bytes).hexdigest(),
+            RUNTIME_ARCHIVE_SIZE=len(self.runtime_bytes),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     @staticmethod
     def _bundle(root: Path) -> Path:
         bundle = root / "sunfish-tpu-offline"
         make_exported_source(bundle / "source")
+        runtime_directory = bundle / standalone_runtime.RUNTIME_ARCHIVE_DIRECTORY
+        runtime_directory.mkdir(parents=True)
+        runtime_archive = runtime_directory / standalone_runtime.RUNTIME_ARCHIVE_NAME
+        runtime_archive.write_bytes(b"sunfish-standalone-runtime-fixture")
+        standalone_runtime.write_runtime_metadata(
+            runtime_archive, bundle / standalone_runtime.RUNTIME_METADATA_NAME
+        )
         wheelhouse = bundle / "wheelhouse"
         wheelhouse.mkdir(parents=True)
         pins = {**RUNTIME_VERSIONS, **TPU_ONLY_RUNTIME_VERSIONS}
@@ -120,7 +158,7 @@ class OfflineBundleTests(unittest.TestCase):
         manifest["builder"] = {
             "operating_system": "linux",
             "machine": "x86_64",
-            "python": "3.12",
+            "python": "3.12.13",
             "libc": ["glibc", "2.31"],
         }
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -137,6 +175,15 @@ class OfflineBundleTests(unittest.TestCase):
                 ],
             )
             self.assertEqual(report["network_policy"], "worker-no-egress")
+            self.assertEqual(report["target"]["minimum_glibc"], "2.17")
+            self.assertEqual(report["target"]["python"], "3.12.13")
+            self.assertEqual(
+                report["python_runtime"]["archive_sha256"],
+                standalone_runtime.RUNTIME_ARCHIVE_SHA256,
+            )
+            inventory = {record["path"] for record in report["files"]}
+            self.assertIn(standalone_runtime.RUNTIME_METADATA_NAME, inventory)
+            self.assertIn(report["python_runtime"]["archive"], inventory)
             self.assertIn("sunfish-diffusion", report["resolved_distributions"])
             wheel = bundle / "wheelhouse/sunfish_diffusion-0.1.0-py3-none-any.whl"
             wheel.write_bytes(b"tampered")
@@ -144,6 +191,66 @@ class OfflineBundleTests(unittest.TestCase):
                 ValueError, "size/type mismatch|hash mismatch|invalid wheel metadata"
             ):
                 verify_bundle(bundle)
+
+    def test_manylinux_wheel_tags_define_the_worker_glibc_floor(self):
+        wheels = [
+            Path("pure-1.0-py3-none-any.whl"),
+            Path("native-1.0-cp312-cp312-manylinux_2_27_x86_64.whl"),
+            Path(
+                "portable-1.0-cp312-cp312-"
+                "manylinux_2_28_x86_64.manylinux2014_x86_64.whl"
+            ),
+        ]
+        self.assertEqual(minimum_glibc_for_wheels(wheels), "2.27")
+        with self.assertRaisesRegex(ValueError, "no versioned manylinux"):
+            minimum_glibc_for_wheels(
+                [Path("native-1.0-cp312-cp312-linux_x86_64.whl")]
+            )
+
+    def test_bundle_rejects_a_forged_glibc_floor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = self._bundle(Path(temporary))
+            manifest_path = bundle / "offline-bundle.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["target"]["minimum_glibc"] = "2.99"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "differs from wheel tags"):
+                verify_bundle(bundle)
+
+    def test_bundle_rejects_runtime_archive_or_metadata_tampering(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = self._bundle(Path(temporary))
+            archive = bundle / standalone_runtime.expected_runtime_metadata()["archive"]
+            original = archive.read_bytes()
+            archive.write_bytes(bytes([original[0] ^ 1]) + original[1:])
+            with self.assertRaisesRegex(ValueError, "hash mismatch|hash differs"):
+                verify_bundle(bundle)
+
+    def test_worker_runtime_rejects_old_glibc_and_proxy_settings(self):
+        manifest = {"target": {"minimum_glibc": "2.28"}}
+        compatible = {
+            "system": "Linux",
+            "machine": "x86_64",
+            "python_version": "3.12.13",
+            "libc": ("glibc", "2.31"),
+            "environment": {},
+            "discovered_proxies": {},
+        }
+        report = verify_worker_runtime_compatibility(manifest, **compatible)
+        self.assertTrue(report["proxy_environment_clear"])
+        with self.assertRaisesRegex(ValueError, "older than bundle floor"):
+            verify_worker_runtime_compatibility(
+                manifest,
+                **{**compatible, "libc": ("glibc", "2.27")},
+            )
+        with self.assertRaisesRegex(ValueError, "proxy settings are forbidden"):
+            verify_worker_runtime_compatibility(
+                manifest,
+                **{
+                    **compatible,
+                    "environment": {"HTTPS_PROXY": "http://proxy.invalid"},
+                },
+            )
 
     def test_pack_writes_a_strict_sha256_sidecar(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -163,6 +270,27 @@ class OfflineBundleTests(unittest.TestCase):
             path.write_text("example==1#not-a-version\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "invalid offline lock"):
                 parse_resolved_lock(path)
+
+    def test_resolved_tpu_lock_requires_exact_requests_pin(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "offline-requirements.lock"
+            with mock.patch(
+                "sunfish_tpu.offline_bundle._installed_distributions",
+                return_value={"jax": "0.10.2", "requests": "2.32.5"},
+            ):
+                result = write_resolved_lock(Path("python"), output)
+            self.assertEqual(result["requests"], "2.32.5")
+            self.assertEqual(
+                [line for line in output.read_text().splitlines() if line.startswith("requests==")],
+                ["requests==2.32.5"],
+            )
+
+            with mock.patch(
+                "sunfish_tpu.offline_bundle._installed_distributions",
+                return_value={"jax": "0.10.2"},
+            ):
+                with self.assertRaisesRegex(RuntimeError, "missing requests"):
+                    write_resolved_lock(Path("python"), output)
 
     def test_worker_gemma_provenance_comes_from_verified_offline_bundle(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -267,6 +395,7 @@ class IapTransportTests(unittest.TestCase):
             "SUNFISH_IAP_SSH_FIREWALL_CONFIRMED": "1",
             "SUNFISH_PRIVATE_GOOGLE_ACCESS_CONFIRMED": "1",
             "SUNFISH_GCS_IAM_CONFIRMED": "1",
+            "SUNFISH_OFFLINE_BUNDLE_ROOT": "/home/sunfish/releases/a",
         }
 
     def test_local_cli_check_needs_no_tpu_identity_and_performs_no_remote_action(self):
@@ -304,6 +433,12 @@ class IapTransportTests(unittest.TestCase):
             self.assertEqual(arguments[:5], ["alpha", "compute", "tpus", "tpu-vm", "ssh"])
             for required in ("--worker=all", "--batch-size=all", "--tunnel-through-iap"):
                 self.assertIn(required, arguments)
+            for keepalive in (
+                "--ssh-flag=-oServerAliveInterval=30",
+                "--ssh-flag=-oServerAliveCountMax=6",
+                "--ssh-flag=-oTCPKeepAlive=yes",
+            ):
+                self.assertIn(keepalive, arguments)
 
             forbidden = {
                 "sudo shutdown now": "allocation lifecycle",
@@ -383,9 +518,12 @@ class IapTransportTests(unittest.TestCase):
             self.assertIn("--batch-size=all", arguments)
             self.assertIn("--tunnel-through-iap", arguments)
             command = arguments[arguments.index("--command") + 1]
-            self.assertIn("python3.12", command)
+            self.assertIn("python3", command)
+            self.assertNotIn("python3.12", command)
             self.assertNotIn("jax", command.lower())
-            self.assertNotIn("http", command.lower())
+            self.assertIn("HTTP_PROXY", command)
+            self.assertIn("proxy_environment_clear", command)
+            self.assertIn("bundled_python_required", command)
 
     def test_controller_preflight_checks_version_account_project_key_and_confirmations(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -457,6 +595,10 @@ class IapTransportTests(unittest.TestCase):
             self.assertEqual(calls.count("--tunnel-through-iap\n"), 3)
             self.assertEqual(calls.count("--batch-size=all\n"), 2)
             self.assertIn("tpu-vm\nscp\n", calls)
+            self.assertEqual(calls.count("verify_tpu_bundled_runtime.sh"), 2)
+            self.assertIn("extract-bundle", calls)
+            self.assertIn("python3", calls)
+            self.assertNotIn("https://", calls)
 
 
 class ReleaseSafetyTests(unittest.TestCase):

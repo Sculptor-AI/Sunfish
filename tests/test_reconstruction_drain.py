@@ -25,6 +25,8 @@ class ReconstructionDrainTests(unittest.TestCase):
             drain = ReconstructionDrain(
                 output_dir=temporary,
                 process_index=0,
+                run_id="calibration-v1",
+                calibration_run_sha256="a" * 64,
                 max_tokens=5,
             )
             self.assertTrue(
@@ -60,6 +62,8 @@ class ReconstructionDrainTests(unittest.TestCase):
             payloads = [json.loads(Path(path).read_text()) for path in manifests]
             self.assertEqual(sum(payload["tokens"] for payload in payloads), 5)
             for payload in payloads:
+                self.assertEqual(payload["run_id"], "calibration-v1")
+                self.assertEqual(payload["calibration_run_sha256"], "a" * 64)
                 self.assertEqual(
                     set(payload["fields"]),
                     {
@@ -79,6 +83,8 @@ class ReconstructionDrainTests(unittest.TestCase):
             drain = ReconstructionDrain(
                 output_dir=temporary,
                 process_index=0,
+                run_id="calibration-v1",
+                calibration_run_sha256="a" * 64,
                 max_tokens=4,
                 initial_tokens=2,
             )
@@ -99,6 +105,8 @@ class ReconstructionDrainTests(unittest.TestCase):
                 ReconstructionDrain(
                     output_dir=temporary,
                     process_index=0,
+                    run_id="calibration-v1",
+                    calibration_run_sha256="a" * 64,
                     max_tokens=1,
                     max_pending=3,
                 )

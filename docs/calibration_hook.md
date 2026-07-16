@@ -119,6 +119,13 @@ At least 100,000 total tokens and 4,000 tokens per bucket are required. The
 mass candidate, reconstruction run identity, and full result. Nothing else
 sets `promotion_allowed=true`.
 
+These numbers are code-level constants, not tunable experiment flags. The
+collector requires a canonical minimum of 75M observed calibration tokens,
+0.225 32E mass coverage, 0.3375 48E mass coverage, and a 100k reconstruction sample.
+The reconstruction gate likewise refuses any RMSE/cosine/token threshold other
+than 0.15/0.99/100k/4k. The CLI options remain visible as explicit runbook
+assertions, but cannot weaken the promotion contract.
+
 The calibration identity, mass candidates, reconstruction identity, and
 approved selection all carry the same launcher-verified Git commit and
 source-tree SHA-256. Reconstruction refuses a candidate or calibration
@@ -127,49 +134,153 @@ crossing implementations.
 
 ## Executable Stage-1 path
 
-Assemble the full corpus off Chase's laptop. Documents are split into fixed
-768-token records before writing, so the manifest's 75M tokens are the tokens
-the TPU runner actually consumes. The total is allocated with the exact
-workload shares in `docs/data.md`:
+The checked-in assembler is currently a structural pilot only. It includes
+explicit substitutes and unresolved streaming revisions, and now stamps every
+manifest `promotion_allowed=false`, even if it happens to contain 75M tokens,
+all six buckets, and no download failures. The command below is useful for
+pipeline rehearsal, not scientific expert selection:
 
 ```bash
 python scripts/assemble_calibration.py \
   --tokenizer /path/to/tokenizer.json \
-  --output /scratch/sunfish-calibration-75m \
-  --total-tokens 75000000 \
+  --output /scratch/sunfish-calibration-75m-plus-margin \
+  --total-tokens 75006144 \
   --record-tokens 768
 ```
 
-After the Stage-0.5 ledger passes, launch the full 128-expert collector on all
-workers (replace every placeholder with immutable GCS paths/digests):
+Before a promotable assembly exists, data review must emit an immutable source
+receipt covering all six exact source IDs and immutable revisions, license
+policy, filters, decontamination method, and canonical token shares. Its source
+profile must be explicitly approved for Stage-1 promotion. A production
+assembler must bind that receipt hash into its manifest and reproduce the same
+source ID/revision for every bucket shard. The current ambiguous source labels
+in `docs/data.md` are targets, not such a receipt. Until that reviewed manifest
+and receipt exist, Stage 1 is deliberately blocked.
+
+After the reviewed shard bytes and draft manifest are staged, inventory only
+the manifest-referenced `.bin`/`.idx` objects (not `manifest.json` or the
+receipt, which would create a hash cycle):
 
 ```bash
-export TEACHER_CHECKPOINT=gs://gemma-data/checkpoints/diffusiongemma-26B-A4B-it
+export CALIBRATION_DATA=gs://YOUR_BUCKET/sunfish/data/calibration-75m
+export DRAFT_CALIBRATION_MANIFEST_SHA256="$(.venv-tpu-controller/bin/python -c \
+  'import hashlib,sys; from etils import epath; print(hashlib.sha256((epath.Path(sys.argv[1]) / "manifest.json").read_bytes()).hexdigest())' \
+  "$CALIBRATION_DATA")"
+export CALIBRATION_CORPUS_INVENTORY="$SUNFISH_LOCAL_CONFIG_DIR/calibration-corpus-inventory.json"
+.venv-tpu-controller/bin/sunfish-stage1-data-inventory \
+  --data-directory "$CALIBRATION_DATA" \
+  --manifest-sha256 "$DRAFT_CALIBRATION_MANIFEST_SHA256" \
+  --output "$CALIBRATION_CORPUS_INVENTORY"
+```
+
+Data review then embeds that exact canonical payload as
+`corpus_gcs_inventory` in the schema-2 source receipt. Finalize the manifest
+with both `source_receipt_sha256` and `corpus_gcs_inventory_sha256`, upload the
+final manifest and receipt, and only then record their byte hashes for launch.
+The inventory rows include bucket/path, generation, size, CRC32C, and each
+manifest-declared SHA-256; unreferenced prefix objects are intentionally
+ignored, while every referenced bin/index object is mandatory.
+
+For the eventual reviewed corpus, documents remain fixed 768-token records.
+Because the distributed runner drops at most `process_count - 1` tail records,
+include one full record of safety margin per process. For eight processes,
+75,006,144 tokens guarantees that the usable prefix can still clear the
+binding 75M observed-token floor.
+
+Stage the teacher before the ordered Stage-0.5 gauntlet. Do not make every TPU
+worker depend on Google's public bucket for a 50.5 GB load at the beginning of
+Stage 1. From the connected controller, inventory the public source, copy it to
+a new content-addressed project-bucket prefix, then require an exact match of
+every relative object name, size, and CRC32C. Generations are expected to
+change during the copy and remain bound by the staged inventory:
+
+```bash
+export UPSTREAM_TEACHER_CHECKPOINT=gs://gemma-data/checkpoints/diffusiongemma-26B-A4B-it
+export TEACHER_SOURCE_INVENTORY="$SUNFISH_LOCAL_CONFIG_DIR/teacher-upstream-inventory.json"
+export TEACHER_STAGED_INVENTORY="$SUNFISH_LOCAL_CONFIG_DIR/teacher-staged-inventory.json"
+export TEACHER_STAGING_RECEIPT="$SUNFISH_LOCAL_CONFIG_DIR/teacher-staging-receipt.json"
 .venv-tpu-controller/bin/sunfish-gcs-inventory \
-  --uri "$TEACHER_CHECKPOINT" --anonymous \
-  --output /tmp/diffusiongemma-teacher-inventory.json
-export TEACHER_REVISION="gcs-inventory-sha256:$(python3 -c \
+  --uri "$UPSTREAM_TEACHER_CHECKPOINT" --anonymous \
+  --output "$TEACHER_SOURCE_INVENTORY"
+export TEACHER_UPSTREAM_INVENTORY_SHA="$(.venv-tpu-controller/bin/python -c \
   'import json,sys; print(json.load(open(sys.argv[1]))["sha256"])' \
-  /tmp/diffusiongemma-teacher-inventory.json)"
+  "$TEACHER_SOURCE_INVENTORY")"
+export TEACHER_CHECKPOINT="gs://YOUR_BUCKET/sunfish/immutable-inputs/diffusiongemma-$TEACHER_UPSTREAM_INVENTORY_SHA"
+
+# The destination is a new prefix. Never use --delete-unmatched-destination-objects.
+gcloud storage rsync --recursive --checksums-only --no-clobber \
+  "$UPSTREAM_TEACHER_CHECKPOINT" "$TEACHER_CHECKPOINT"
+.venv-tpu-controller/bin/sunfish-gcs-inventory \
+  --uri "$TEACHER_CHECKPOINT" \
+  --output "$TEACHER_STAGED_INVENTORY" \
+  --match-content-of "$TEACHER_SOURCE_INVENTORY" \
+  --match-output "$TEACHER_STAGING_RECEIPT"
+export TEACHER_STAGED_INVENTORY_SHA="$(.venv-tpu-controller/bin/python -c \
+  'import json,sys; print(json.load(open(sys.argv[1]))["sha256"])' \
+  "$TEACHER_STAGED_INVENTORY")"
+export TEACHER_REVISION="gcs-inventory-sha256:$TEACHER_STAGED_INVENTORY_SHA"
+```
+
+After the offline release and rendered smoke config are present on every
+worker—but before Gate 1—prove that every host can list the exact staged
+inventory and range-read one byte from every nonempty object. The probe
+re-inventories after those reads and fails if an object changes. It does not
+download the checkpoint:
+
+```bash
+export TEACHER_PROBE_RUN_ID="stage05-teacher-read-$SUNFISH_RUN_TAG"
+scripts/launch_tpu_pod.sh \
+  --run-id "$TEACHER_PROBE_RUN_ID" \
+  --attempt-id "$TEACHER_PROBE_RUN_ID-001" \
+  --config "$SMOKE_LOCAL_CONFIG" \
+  --remote-config "$SMOKE_REMOTE_CONFIG" \
+  -- \
+  .venv-tpu/bin/sunfish-gcs-inventory \
+  --uri "$TEACHER_CHECKPOINT" \
+  --expected-sha256 "$TEACHER_STAGED_INVENTORY_SHA" \
+  --probe-readable \
+  --output "/tmp/sunfish-teacher-$TEACHER_STAGED_INVENTORY_SHA.json"
+```
+
+Any failed host blocks the gauntlet. Keep both inventories, the match receipt,
+and the all-worker probe logs with the run handoff. A plain public-bucket URI or
+`--source-anonymous` is not an approved Stage-1 input.
+
+After the Stage-0.5 ledger passes, launch the full 128-expert collector on all
+workers (replace every remaining placeholder with immutable GCS paths/digests).
+Long attempts remain foreground children of the signal-owning host entrypoint,
+but must run under the durable controller contract described in
+`infra/tpu/README.md`:
+
+```bash
 export STAGE05_LEDGER="$SUNFISH_READINESS/stage05-readiness-ledger.json"
 export STAGE05_LEDGER_SHA256="$(.venv-tpu-controller/bin/python -c \
   'import hashlib,sys; from etils import epath; print(hashlib.sha256(epath.Path(sys.argv[1]).read_bytes()).hexdigest())' \
   "$STAGE05_LEDGER")"
+export CALIBRATION_SOURCE_RECEIPT=gs://YOUR_BUCKET/sunfish/data/calibration-75m/source-receipt.json
+export CALIBRATION_DATA=gs://YOUR_BUCKET/sunfish/data/calibration-75m
+export CALIBRATION_SOURCE_RECEIPT_SHA256="$(.venv-tpu-controller/bin/python -c \
+  'import hashlib,sys; from etils import epath; print(hashlib.sha256(epath.Path(sys.argv[1]).read_bytes()).hexdigest())' \
+  "$CALIBRATION_SOURCE_RECEIPT")"
 
 scripts/launch_tpu_pod.sh \
   --run-id sunfish-calibration-v1 \
   --attempt-id sunfish-calibration-v1-001 \
   --config "$SMOKE_LOCAL_CONFIG" \
   --remote-config "$SMOKE_REMOTE_CONFIG" \
+  --require-durable-controller \
+  --attempt-number 1 \
+  --max-attempts 3 \
   -- \
   .venv-tpu/bin/sunfish-calibrate \
   --source-checkpoint "$TEACHER_CHECKPOINT" \
   --source-revision "$TEACHER_REVISION" \
-  --source-anonymous \
   --readiness-ledger "$STAGE05_LEDGER" \
   --readiness-ledger-sha256 "$STAGE05_LEDGER_SHA256" \
-  --data-directory gs://YOUR_BUCKET/sunfish/data/calibration-75m \
+  --data-directory "$CALIBRATION_DATA" \
   --data-manifest-sha256 CALIBRATION_MANIFEST_SHA256 \
+  --data-source-receipt "$CALIBRATION_SOURCE_RECEIPT" \
+  --data-source-receipt-sha256 "$CALIBRATION_SOURCE_RECEIPT_SHA256" \
   --output-dir gs://YOUR_BUCKET/sunfish/calib \
   --raw-output-dir gs://YOUR_BUCKET/sunfish/calib/raw \
   --run-id sunfish-calibration-v1 \
@@ -182,11 +293,24 @@ scripts/launch_tpu_pod.sh \
   --reconstruction-tokens 100000
 ```
 
-The calibration runner revalidates every ordered gate, evidence hash,
-topology, source identity, config-bundle pin, and Stage-0 parity pin before it
-loads the teacher. It records the ledger path and byte hash in
-`calibration-run.json`; reconstruction re-reads the same ledger and refuses an
-edited, replaced, failed, or different-topology receipt.
+The calibration runner revalidates the manifest bytes, reviewed source receipt,
+and generation/CRC-bound corpus subset before distributed JAX initialization.
+It then verifies every full shard SHA-256 while opening the source and re-lists
+the corpus after use before any mass candidate can be promotable. It records
+the full corpus inventory and digest alongside the receipt and ledger hashes
+in `calibration-run.json`; that digest must agree through the summary, mass
+candidate, reconstruction approval, and production seed metadata. The staged
+teacher inventory is likewise checked again after `gm.ckpts.load_params`, so
+its recorded generations and CRC32Cs span the actual load.
+
+On completion it also writes
+`reconstruction-artifact-inventory.json`, which pins the exact per-host raw
+manifest set, each manifest hash, every declared tensor hash, bucket count,
+run ID, and calibration-run hash. Reconstruction refuses appended, removed,
+relabelled, or replaced manifests before JAX initialization and re-hashes the
+large tensor payloads as it consumes them. Process-0 finalization failures are
+broadcast to every worker so peers fail together instead of hanging in a final
+collective.
 
 If the 32E mass candidate passes, run its reconstruction gate. If it fails,
 use `selection-mass-candidate-48e.json` only when that fallback's mass gate
@@ -198,10 +322,12 @@ scripts/launch_tpu_pod.sh \
   --attempt-id sunfish-reconstruction-32e-v1-001 \
   --config "$SMOKE_LOCAL_CONFIG" \
   --remote-config "$SMOKE_REMOTE_CONFIG" \
+  --require-durable-controller \
+  --attempt-number 1 \
+  --max-attempts 3 \
   -- \
   .venv-tpu/bin/sunfish-reconstruction-gate \
   --source-checkpoint "$TEACHER_CHECKPOINT" \
-  --source-anonymous \
   --calibration-dir gs://YOUR_BUCKET/sunfish/calib/sunfish-calibration-v1 \
   --raw-dir gs://YOUR_BUCKET/sunfish/calib/raw/sunfish-calibration-v1 \
   --candidate gs://YOUR_BUCKET/sunfish/calib/sunfish-calibration-v1/selection-mass-candidate.json \
@@ -219,7 +345,14 @@ scripts/launch_tpu_pod.sh \
 This approval is for the storage-pruning rung (32/8 or 48/8) only. Its
 `top_k_experts=8` is enforced by both converters and seed materialization; it
 cannot initialize a 32/4 run until the later top-k ablation emits a new
-approved sidecar for that rung.
+approved sidecar for that rung and its separate schema validator is implemented.
+
+The Orbax seed materializer accepts a production selection only when it matches
+the complete schema emitted here: exact purpose/method, both gate booleans,
+canonical thresholds, 75M/full-record evidence, source and dataset lineage,
+artifact-inventory hash, all calibration/reconstruction hashes, passing worst
+metrics, and an exact 30-layer selection. A hand-written
+`promotion_allowed=true` boolean is rejected.
 
 ## Sanity invariants (assert at flush)
 

@@ -1,9 +1,11 @@
 # Sunfish training and infrastructure plan
 
-Status: infrastructure scaffold implemented; the handed-off TPU pod is
-non-preemptible and must not be lifecycle-mutated, while its exact JAX
-topology/counts still require live measurement. Dollar figures are planning
-envelopes, not quotes; pilot runs exist to replace them with measurements.
+Status: infrastructure scaffold implemented; the allocation is described as
+non-preemptible and must not be lifecycle-mutated, while its exact image,
+project, zone, host count, and JAX topology still require an owner-confirmed
+record plus live measurement. This document is not evidence that the pod has
+been probed. Dollar figures are planning envelopes, not quotes; pilot runs
+exist to replace them with measurements.
 
 ## Framework decision: JAX-first training
 
@@ -38,9 +40,11 @@ Fit by phase:
   confirmed topology. Only run concurrent replicas after a measured one-replica
   memory/throughput pilot; replica count is not assumed in advance.
 - **Router training, distillation, LoRA recovery, diffusion SFT (phases
-  4-6)** — fit is measured with the actual mesh. Router-only and LoRA pilots
-  should fit an eight-device slice; larger allocations primarily add data
-  parallel throughput.
+  4-6)** — fit is measured with the actual mesh. The committed replicated
+  Phase-A profile targets v4 devices with 32 GiB HBM and is not portable to an
+  arbitrary eight-device slice. A smaller-HBM or different-count grant needs
+  the Phase-B sharded policy or a new reviewed profile; larger allocations do
+  not automatically imply a safe per-device batch.
 - **Full-parameter unfreeze** — remains both evidence- and topology-gated.
   Optimizer, activation, and sharding memory must be measured before enabling
   it; no unconfirmed HBM budget appears in the plan.
@@ -98,17 +102,22 @@ envelope.
 
 ## Storage budget (run profile)
 
-Provision a **~5 TB regional GCS bucket in the TPU zone** (intra-region reads
-are free), plus ~150 GB of local disk for stage-0 conversion. GCS bills per
-GB-month prorated (~$3.30/day at the 5 TB peak), and the dominant object —
-the full teacher trace store — lives only for the ~2-3 weeks around stages
-2-3 before its lifecycle rule deletes it, so **whole-program storage spend is
-~$100-200 one-time**. Decision: prioritize run quality over storage
-micro-optimization; full offline traces make distillation sweeps replayable
-without regenerating teacher outputs. The lean-profile techniques below
-(streaming staging, on-device stat aggregation, delta checkpoints once
-exact-resume covers them) still apply — they are good engineering, just no
-longer forced by budget.
+For a `us-central2-b` TPU, provision a **~5 TB regional Standard bucket in
+`us-central1`**: Cloud Storage does not offer a `us-central2` location. Current
+pricing charges regional storage plus cross-region reads into the TPU region,
+so the old "intra-region reads are free" assumption does not apply. Re-price
+the run from the official [Cloud Storage locations](https://cloud.google.com/storage/docs/locations)
+and [data-transfer pricing](https://cloud.google.com/storage/pricing#network-pricing)
+before launch; the approved 5 TB/full-offline-trace profile remains the quality
+decision, but `$100-200` is a planning estimate rather than a cap. Enable
+hierarchical namespace and uniform bucket-level access if the allocation owner
+can provision them before data lands, and use retention/lifecycle rules rather
+than object versioning or Bucket Lock for transient checkpoints/traces. The
+dominant trace store lives only for the ~2-3 weeks around stages 2-3 before its
+lifecycle rule deletes it. The lean-profile techniques below (streaming
+staging, on-device stat aggregation, delta checkpoints once exact-resume
+covers them) still apply — they are good engineering, just no longer forced by
+budget.
 
 | Component | Budget | How it stays small |
 | --- | --- | --- |
@@ -146,13 +155,16 @@ replaying stored traces; and a divergence noticed later than 2-3 checkpoints
 back means restarting the phase from its milestone rather than rewinding
 precisely. Both are cheap at our phase lengths.
 
-Memory sanity: the bf16 student is ~16.2 GB. With experts and backbone frozen
-and only router/LoRA parameters carrying optimizer state, a v3-8 (128 GB HBM)
-or a single A100 80 GB holds weights, activations (with checkpointing), and
-optimizer with a comfortable margin. Distillation defaults to the full offline
-trace store on every provider. Rolling-window traces are a storage fallback;
-online co-residency is enabled only after a topology-specific fit and
-end-to-end throughput measurement.
+Memory sanity: the bf16 student is ~16.2 GB before activations, gradients,
+logits, caches, or optimizer state. Aggregate slice memory is not a per-device
+fit proof: the current Phase-A model is replicated. Partial-phase metrics now
+touch only trainable gradient leaves and recovery uses block rematerialization,
+but only Gate 4 HBM evidence and the separate K=4 recovery pilot may approve a
+long run. A v3-8 or any smaller-HBM fallback requires an explicit sharded
+profile; it is not accepted merely because its aggregate HBM is large.
+Distillation defaults to the full offline trace store on every provider.
+Rolling-window traces are a storage fallback; online co-residency is enabled
+only after a topology-specific fit and end-to-end throughput measurement.
 
 ## Throughput and cost model
 

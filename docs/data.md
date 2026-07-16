@@ -33,10 +33,30 @@ destroy even though the coding buckets never route to them. In
 `expert_selection.select_experts` they enter with low `bucket_weights` but a
 real `min_coverage` floor — down-weighted, not unprotected.
 
-The executable assembler enforces these shares by token count and splits
-documents into fixed 768-token records before writing the immutable manifest.
-That prevents long documents from inflating the advertised 75M budget while
-the TPU runner observes only their first prompt/canvas window.
+The source names in the table are design targets, not immutable dataset IDs or
+revisions. The checked-in executable assembler currently uses pilot
+substitutes; every manifest it writes is explicitly non-promotable regardless
+of size or structural completeness. A promotable corpus requires a separately
+reviewed immutable receipt binding each bucket's exact source ID/revision,
+license policy, filters, decontamination method, and token share. The manifest
+must bind that receipt hash and match every bucket source exactly. The
+schema-2 receipt must also embed the canonical inventory of every referenced
+`.bin`/`.idx` object: bucket/path, GCS generation, byte size, CRC32C, and the
+SHA-256 declared by the manifest. The manifest binds that inventory digest.
+Stage 1 re-lists the exact GCS subset before JAX, verifies every full artifact
+SHA-256 when opening the source, and re-lists after collection before emitting
+promotion evidence. An equal-length replacement therefore cannot inherit a
+reviewed receipt.
+
+The eventual reviewed assembler must enforce these shares by token count and
+split documents into fixed 768-token records before writing the immutable
+manifest. That prevents long documents from inflating the advertised budget
+while the TPU runner observes only their first prompt/canvas window. The
+collector drops at most `process_count - 1` tail records to keep every collective
+process-divisible, so a promotable corpus must contain a safety margin above 75M:
+`75,000,000 + process_count * 768` tokens. For eight processes, assemble at
+least 75,006,144 tokens; the gate uses measured usable-prefix tokens and still
+requires at least 75,000,000.
 
 ## Recovery corpus (1-3B tokens, phase 5)
 

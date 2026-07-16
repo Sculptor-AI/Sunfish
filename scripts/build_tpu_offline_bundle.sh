@@ -36,10 +36,10 @@ done
   exit 2
 }
 
-PYTHON_BIN="${PYTHON_BIN:-python3.12}"
-"${PYTHON_BIN}" -c \
-  'import platform,sys; assert sys.version_info[:2] == (3, 12); assert platform.system() == "Linux"; assert platform.machine().lower() in {"x86_64", "amd64"}; assert platform.libc_ver()[0].lower() == "glibc"' || {
-  echo "offline TPU bundles must be built on glibc Linux x86_64 with CPython 3.12" >&2
+bootstrap_python="${SUNFISH_BUILD_BOOTSTRAP_PYTHON:-python3}"
+"${bootstrap_python}" -c \
+  'import platform,sys,tarfile,urllib.request; assert sys.version_info >= (3,10); assert platform.python_implementation() == "CPython"; assert platform.system() == "Linux"; assert platform.machine().lower() in {"x86_64", "amd64"}; assert platform.libc_ver()[0].lower() == "glibc"; assert callable(tarfile.open); assert callable(urllib.request.urlopen)' || {
+  echo "offline TPU bundles require stock CPython >=3.10 on glibc Linux x86_64" >&2
   exit 2
 }
 
@@ -49,7 +49,30 @@ temporary="$(mktemp -d)"
 trap 'rm -rf "${temporary}"' EXIT
 bundle_root="${temporary}/sunfish-tpu-offline"
 wheelhouse="${bundle_root}/wheelhouse"
-mkdir -p "${wheelhouse}"
+runtime_archive_name='cpython-3.12.13+20260623-x86_64-unknown-linux-gnu-install_only.tar.gz'
+runtime_archive="${bundle_root}/python-runtime/${runtime_archive_name}"
+runtime_url='https://github.com/astral-sh/python-build-standalone/releases/download/20260623/cpython-3.12.13%2B20260623-x86_64-unknown-linux-gnu-install_only.tar.gz'
+mkdir -p "${wheelhouse}" "$(dirname "${runtime_archive}")"
+
+# This is the only public-network fetch beyond the pinned Python package
+# resolver, and it runs only on the explicitly confirmed connected builder.
+# The URL is never copied into bundle metadata or a TPU worker command.
+"${bootstrap_python}" -c \
+  'import pathlib,shutil,sys,urllib.request; url=sys.argv[1]; output=pathlib.Path(sys.argv[2]); request=urllib.request.Request(url,headers={"User-Agent":"sunfish-offline-builder/1"}); response=urllib.request.urlopen(request,timeout=60); destination=output.open("xb"); shutil.copyfileobj(response,destination,1024*1024); destination.close(); response.close()' \
+  "${runtime_url}" "${runtime_archive}"
+PYTHONPATH=src "${bootstrap_python}" -m sunfish_tpu.standalone_runtime write-metadata \
+  --archive "${runtime_archive}" \
+  --output "${bundle_root}/python-runtime.json"
+builder_runtime_root="${temporary}/builder-runtime"
+PYTHONPATH=src "${bootstrap_python}" -m sunfish_tpu.standalone_runtime install \
+  --bundle-root "${bundle_root}" \
+  --destination "${builder_runtime_root}"
+PYTHON_BIN="${builder_runtime_root}/python/bin/python3"
+"${PYTHON_BIN}" -c \
+  'import platform,sys; assert platform.python_implementation()=="CPython"; assert platform.python_version()=="3.12.13"; assert platform.system()=="Linux"; assert platform.machine().lower() in {"x86_64","amd64"}; assert platform.libc_ver()[0].lower()=="glibc"' || {
+  echo "downloaded standalone runtime is not exact CPython 3.12.13 for glibc Linux x86_64" >&2
+  exit 2
+}
 
 PYTHONPATH=src "${PYTHON_BIN}" -m sunfish_tpu.offline_bundle export-source \
   --repository "${root}" \
@@ -112,6 +135,10 @@ PIP_NO_INDEX=1 "${second_venv}/bin/python" -m pip check
 PYTHONPATH=src "${PYTHON_BIN}" -m sunfish_tpu.offline_bundle verify-installed \
   --bundle-root "${bundle_root}" \
   --python "${second_venv}/bin/python"
+# Isolated mode removes the checkout and PYTHONPATH from import resolution.
+# Prove the regular wheel contains the exact config path used by sunfish-train.
+"${second_venv}/bin/python" -I -c \
+  'from sunfish_tpu.training.train import _packaged_kauldron_config_path; print(_packaged_kauldron_config_path())'
 SUNFISH_OFFLINE_BUNDLE_MANIFEST="${bundle_root}/offline-bundle.json" \
   "${second_venv}/bin/sunfish-runtime-api-audit" \
   --output "${temporary}/runtime-api-audit.json"

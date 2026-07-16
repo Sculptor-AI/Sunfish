@@ -4,7 +4,9 @@ from unittest import mock
 
 from sunfish_tpu.gcs_inventory import (
     build_gcs_inventory,
+    compare_gcs_inventory_contents,
     gcs_inventory_from_objects,
+    probe_gcs_object_reads,
     validate_gcs_inventory,
     verify_live_gcs_inventory,
 )
@@ -81,6 +83,69 @@ class GcsInventoryTests(unittest.TestCase):
             verify_live_gcs_inventory(
                 "gs://bucket/checkpoints/seed", expected
             )
+
+    def test_staged_content_match_ignores_generation_but_not_bytes(self):
+        source = gcs_inventory_from_objects(
+            "gs://public/checkpoint",
+            [
+                {"name": "a", "generation": 1, "size": 3, "crc32c": "abc="},
+                {"name": "b", "generation": 2, "size": 4, "crc32c": "def="},
+            ],
+        )
+        staged = gcs_inventory_from_objects(
+            "gs://project/staged/checkpoint",
+            [
+                {"name": "a", "generation": 101, "size": 3, "crc32c": "abc="},
+                {"name": "b", "generation": 102, "size": 4, "crc32c": "def="},
+            ],
+        )
+        receipt = compare_gcs_inventory_contents(source, staged)
+        self.assertTrue(receipt["matched"])
+        self.assertEqual(receipt["object_count"], 2)
+        self.assertEqual(receipt["total_bytes"], 7)
+        self.assertEqual(receipt["source_inventory_sha256"], source["sha256"])
+        self.assertEqual(receipt["staged_inventory_sha256"], staged["sha256"])
+
+        changed = gcs_inventory_from_objects(
+            "gs://project/staged/checkpoint",
+            [
+                {"name": "a", "generation": 101, "size": 3, "crc32c": "WRONG="},
+                {"name": "b", "generation": 102, "size": 4, "crc32c": "def="},
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "names/sizes/CRC32Cs"):
+            compare_gcs_inventory_contents(source, changed)
+
+    def test_bounded_read_probe_reads_one_byte_per_nonempty_object(self):
+        payload = gcs_inventory_from_objects(
+            "gs://project/staged/checkpoint",
+            [
+                {"name": "a", "generation": 1, "size": 3, "crc32c": "abc="},
+                {"name": "empty", "generation": 2, "size": 0, "crc32c": "def="},
+            ],
+        )
+
+        class FakePath:
+            def __init__(self, raw):
+                self.raw = raw
+
+            def open(self, mode):
+                self.assert_mode = mode
+                from io import BytesIO
+
+                return BytesIO(b"payload")
+
+            def __str__(self):
+                return self.raw
+
+        self.assertEqual(
+            probe_gcs_object_reads(
+                "gs://project/staged/checkpoint",
+                payload,
+                path_factory=FakePath,
+            ),
+            1,
+        )
 
 
 if __name__ == "__main__":

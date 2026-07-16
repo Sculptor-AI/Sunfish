@@ -42,10 +42,13 @@ once** — this rule already appears per-stage below and it is the plan's spine.
 
 Download upstream checkpoint → `checkpoint_audit.py --list` for real tensor
 names → dependency-free streaming converter (raw safetensors byte ranges) →
-**no-prune 128/8 text-only control**. Static P1 validation has passed against
-the full downloaded snapshot (691/691 retained tensors); the executable
-P2-P5 harness is implemented in `sunfish_tpu.parity` but its high-memory model
-forwards have not run yet. The model-level gate therefore remains open.
+**no-prune 128/8 text-only control**. The underlying static P1 comparison
+passed against the full downloaded snapshot (691/691 retained tensors), but
+the committed report predates the required source-identity schema and cannot
+unlock deployment. P1 must be regenerated from the final deployable source in
+the same report as P2-P5. The executable P2-P5 harness is implemented in
+`sunfish_tpu.parity`, but its high-memory model forwards have not run yet. The
+entire source-bound model-level gate therefore remains open.
 Header audits and unit tests are laptop-safe; the P2-P5 25B model forwards run
 on a high-memory CPU host, never Chase's laptop.
 **Gate:** control reproduces upstream logits and generations exactly.

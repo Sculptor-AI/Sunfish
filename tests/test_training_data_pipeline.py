@@ -1,11 +1,17 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 try:
     import numpy as np
+    from kauldron.data import iterators as kd_iterators
 
-    from sunfish_tpu.training.data import TrainingRecordSource
+    from sunfish_tpu.training.data import (
+        TimedPyGrainIterator,
+        TrainingRecordSource,
+        consume_input_wait_metrics,
+    )
 except ImportError as error:
     DATA_IMPORT_ERROR = error
 else:
@@ -91,6 +97,23 @@ class TrainingDataPipelineTests(unittest.TestCase):
         self.assertEqual(metrics["records_read"], 1)
         self.assertGreater(metrics["payload_bytes_read"], 0)
         self.assertGreaterEqual(metrics["range_read_seconds"], 0.0)
+
+    def test_checkpoint_restore_preserves_timed_iterator_wrapper(self):
+        consume_input_wait_metrics()
+        original = TimedPyGrainIterator(source=object(), iter=iter(()))
+        plain_restored = kd_iterators.PyGrainIterator(
+            source=object(), iter=iter((123,))
+        )
+        with mock.patch.object(
+            kd_iterators.PyGrainIterator,
+            "__kd_ocp_restore_post__",
+            return_value=plain_restored,
+        ):
+            restored = original.__kd_ocp_restore_post__(object())
+        self.assertIsInstance(restored, TimedPyGrainIterator)
+        self.assertIs(restored.source, plain_restored.source)
+        self.assertEqual(next(restored), 123)
+        self.assertEqual(consume_input_wait_metrics()["samples"], 1)
 
 
 if __name__ == "__main__":

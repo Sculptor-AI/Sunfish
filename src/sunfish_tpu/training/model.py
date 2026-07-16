@@ -9,6 +9,7 @@ from gemma.diffusion.hackable_diffusion_adapter.hd import hd_gemma_network
 import jax.numpy as jnp
 
 from sunfish_tpu.training.lora import SunfishLoRA
+from sunfish_tpu.training.remat import enable_upstream_block_rematerialization
 
 
 def make_gemma_network(
@@ -18,8 +19,11 @@ def make_gemma_network(
     dtype: str,
     use_lora: bool,
     lora_rank: int,
+    rematerialize_blocks: bool = False,
 ):
     """Create Sunfish by changing only audited expert-count routing fields."""
+    if rematerialize_blocks:
+        enable_upstream_block_rematerialization()
     if dtype == "bfloat16":
         jax_dtype = jnp.bfloat16
     elif dtype == "float32":

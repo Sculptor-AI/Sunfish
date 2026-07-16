@@ -182,9 +182,16 @@ def _read_raw_header(path: Path) -> tuple[list[RawTensor], object | None, int]:
 
 
 def _load_json_object(path: Path) -> dict[str, object]:
-    value = json.loads(path.read_text())
+    return _load_json_object_bytes(path.read_bytes(), source=str(path))
+
+
+def _load_json_object_bytes(payload: bytes, *, source: str) -> dict[str, object]:
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{source} must contain valid UTF-8 JSON") from error
     if not isinstance(value, dict):
-        raise ValueError(f"{path} must contain a JSON object")
+        raise ValueError(f"{source} must contain a JSON object")
     return value
 
 
@@ -195,7 +202,26 @@ def load_selection_manifest(
     retained_experts: int,
     top_k_experts: int | None = None,
 ) -> dict[int, tuple[int, ...]]:
-    payload = _load_json_object(path)
+    """Load one selection path exactly once, then validate its layer IDs."""
+    return load_selection_manifest_bytes(
+        path.read_bytes(),
+        source_experts=source_experts,
+        retained_experts=retained_experts,
+        top_k_experts=top_k_experts,
+        source=str(path),
+    )
+
+
+def load_selection_manifest_bytes(
+    manifest_bytes: bytes,
+    *,
+    source_experts: int,
+    retained_experts: int,
+    top_k_experts: int | None = None,
+    source: str = "selection manifest bytes",
+) -> dict[int, tuple[int, ...]]:
+    """Validate layer IDs from an already captured immutable byte snapshot."""
+    payload = _load_json_object_bytes(manifest_bytes, source=source)
     if "source_experts" in payload and int(payload["source_experts"]) != source_experts:
         raise ValueError("selection source_experts does not match the checkpoint")
     if "retained_experts" in payload and int(payload["retained_experts"]) != retained_experts:

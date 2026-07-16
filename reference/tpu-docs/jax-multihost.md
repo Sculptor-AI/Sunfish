@@ -1,6 +1,8 @@
 # JAX multi-host essentials (distilled)
 
-Source: https://docs.jax.dev/en/latest/multi_process.html (fetched 2026-07-11)
+Sources: https://docs.jax.dev/en/latest/multi_process.html and
+https://docs.jax.dev/en/latest/_autosummary/jax.distributed.initialize.html
+(verified 2026-07-16)
 
 ## jax.distributed.initialize() — the iron rule
 
@@ -12,6 +14,10 @@ Source: https://docs.jax.dev/en/latest/multi_process.html (fetched 2026-07-11)
   address, process id, and count are autodetected from the environment.
 - Manual form: `jax.distributed.initialize(coordinator_address="host:port",
   num_processes=N, process_id=i)`.
+- Reject or unset `HTTP_PROXY`, `HTTPS_PROXY`, and equivalent proxy variables
+  before launch. JAX explicitly warns that they can make distributed
+  initialization time out; Sunfish fails closed rather than waiting through an
+  ambiguous five-minute initialization timeout.
 
 ## Process semantics
 
@@ -46,3 +52,4 @@ Source: https://docs.jax.dev/en/latest/multi_process.html (fetched 2026-07-11)
 4. Verify: expected global device count, expected process count, unique
    process_index values, expected local device count, and one REAL
    collective (psum over a sharded array) — not a local 1+1.
+5. Verify proxy variables are absent before importing JAX.

@@ -26,10 +26,14 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from sunfish.checkpoint_convert import load_selection_manifest
+from sunfish.checkpoint_convert import load_selection_manifest_bytes
 from sunfish.model_budget import DiffusionMoEBudget
 from sunfish.source_tree import workspace_source_identity
-from sunfish_tpu.seed_manifest import selection_metadata
+from sunfish_tpu.seed_manifest import (
+    canonical_layer_selection_sha256,
+    selection_metadata_bytes,
+)
+from sunfish_tpu.source_identity import normalize_source_identity
 
 SOURCE_EXPERTS = 128
 NUM_LAYERS = 30
@@ -60,6 +64,59 @@ class PrunableLeaf:
     layer: int
     kind: str
     expert_axis: int
+
+
+@dataclasses.dataclass(frozen=True)
+class SelectionSnapshot:
+    layers: dict[int, tuple[int, ...]]
+    metadata: dict[str, Any]
+    sha256: str
+    layers_sha256: str
+
+
+def load_selection_snapshot(
+    path: Path,
+    *,
+    source_experts: int,
+    retained_experts: int,
+    top_k_experts: int,
+) -> SelectionSnapshot:
+    """Read selection bytes once and derive every selection attestation from them."""
+    manifest_bytes = path.read_bytes()
+    layers = load_selection_manifest_bytes(
+        manifest_bytes,
+        source_experts=source_experts,
+        retained_experts=retained_experts,
+        top_k_experts=top_k_experts,
+        source=str(path),
+    )
+    if set(layers) != set(range(NUM_LAYERS)):
+        raise ValueError("selection must contain exactly layers 0..29")
+    metadata = selection_metadata_bytes(manifest_bytes)
+    canonical_layers = {
+        str(layer): list(layers[layer]) for layer in range(NUM_LAYERS)
+    }
+    if metadata.get("layers") != canonical_layers:
+        raise ValueError("selection metadata layer IDs differ from pruning selection")
+    layers_sha256 = canonical_layer_selection_sha256(canonical_layers)
+    if metadata.get("layers_sha256") != layers_sha256:
+        raise ValueError("selection metadata layer digest differs")
+    return SelectionSnapshot(
+        layers=layers,
+        metadata=metadata,
+        sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+        layers_sha256=layers_sha256,
+    )
+
+
+def require_unchanged_source_inventory(
+    before: Mapping[str, Any], after: Mapping[str, Any]
+) -> None:
+    """Fail if the source prefix crossed object generations during its load."""
+    if before != after:
+        raise RuntimeError(
+            "source checkpoint GCS inventory changed while loading parameters"
+        )
 
 
 def classify_prunable_path(path: Sequence[str]) -> PrunableLeaf | None:
@@ -205,8 +262,20 @@ def _prune_nested_params(
     flax,
     jax,
     jnp,
+    selection_layers_sha256: str | None = None,
     delete_source_arrays: bool = True,
 ) -> tuple[Any, dict[str, Any]]:
+    canonical_layers = {
+        str(layer): list(selection[layer]) for layer in range(NUM_LAYERS)
+    }
+    actual_selection_layers_sha256 = canonical_layer_selection_sha256(
+        canonical_layers
+    )
+    if (
+        selection_layers_sha256 is not None
+        and selection_layers_sha256 != actual_selection_layers_sha256
+    ):
+        raise ValueError("selection layer digest differs from pruning inputs")
     flat = flax.traverse_util.flatten_dict(params)
     inventory: dict[int, set[str]] = {}
     pruned_paths: list[str] = []
@@ -238,6 +307,7 @@ def _prune_nested_params(
         raise RuntimeError(f"pruned {len(pruned_paths)} leaves, expected 120")
     return flax.traverse_util.unflatten_dict(flat), {
         "pruned_leaves": len(pruned_paths),
+        "selection_layers_sha256": actual_selection_layers_sha256,
         "paths_sha256": hashlib.sha256(
             json.dumps(sorted(pruned_paths), separators=(",", ":")).encode("utf-8")
         ).hexdigest(),
@@ -271,20 +341,31 @@ def materialize_orbax_seed(
             f"at least {min_host_memory_gib} GiB is required"
         )
 
-    selection = load_selection_manifest(
+    selection_snapshot = load_selection_snapshot(
         selection_path,
         source_experts=SOURCE_EXPERTS,
         retained_experts=retained_experts,
+        top_k_experts=top_k_experts,
     )
-    if set(selection) != set(range(NUM_LAYERS)):
-        raise ValueError("selection must contain exactly layers 0..29")
-    selection_provenance = selection_metadata(selection_path)
+    selection = selection_snapshot.layers
+    selection_provenance = selection_snapshot.metadata
     if selection_provenance["source_experts"] != SOURCE_EXPERTS:
         raise ValueError("selection metadata source expert count differs")
     if selection_provenance["retained_experts"] != retained_experts:
         raise ValueError("selection metadata retained expert count differs")
     if selection_provenance["top_k_experts"] != top_k_experts:
         raise ValueError("selection metadata top-k differs")
+    materializer_source_identity = workspace_source_identity(
+        Path(__file__).resolve().parents[2]
+    )
+    if selection_provenance["promotion_allowed"] and (
+        selection_provenance.get("source_revision") != source_revision
+        or normalize_source_identity(selection_provenance.get("sunfish_source"))
+        != normalize_source_identity(materializer_source_identity)
+    ):
+        raise ValueError(
+            "approved production selection differs from materializer source lineage"
+        )
     expected_target_parameters = audited_target_text_parameters(retained_experts)
 
     # Heavy imports happen only after the laptop/RAM guard.
@@ -327,6 +408,12 @@ def materialize_orbax_seed(
         )
 
     source_params = gm.ckpts.load_params(source_path, text_only=True)
+    source_inventory_post_load = build_gcs_inventory(
+        source, anonymous=source_anonymous
+    )
+    require_unchanged_source_inventory(
+        source_inventory, source_inventory_post_load
+    )
     source_signature = _tree_signature(source_params, flax)
     require_parameter_count(
         source_signature,
@@ -340,6 +427,7 @@ def materialize_orbax_seed(
         flax=flax,
         jax=jax,
         jnp=jnp,
+        selection_layers_sha256=selection_snapshot.layers_sha256,
     )
     del source_params
     pruned_signature = _tree_signature(pruned_nested, flax)
@@ -389,6 +477,7 @@ def materialize_orbax_seed(
         "source": str(source_path),
         "source_revision": source_revision,
         "source_gcs_inventory": source_inventory,
+        "source_gcs_inventory_post_load": source_inventory_post_load,
         "source_tree": source_signature,
         "intermediate": str(intermediate_path),
         "pruned_nested_tree": pruned_signature,
@@ -401,13 +490,12 @@ def materialize_orbax_seed(
         "top_k_experts": top_k_experts,
         "layers": NUM_LAYERS,
         "selection_path": str(selection_path.resolve()),
-        "selection_sha256": hashlib.sha256(selection_path.read_bytes()).hexdigest(),
+        "selection_sha256": selection_snapshot.sha256,
+        "selection_layers_sha256": selection_snapshot.layers_sha256,
         "selection_metadata": selection_provenance,
         "pruning": pruning,
         "runtime_versions": versions,
-        "sunfish_source": workspace_source_identity(
-            Path(__file__).resolve().parents[2]
-        ),
+        "sunfish_source": materializer_source_identity,
         "host": {
             "platform": platform.platform(),
             "python": platform.python_version(),

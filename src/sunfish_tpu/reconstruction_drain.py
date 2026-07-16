@@ -10,6 +10,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 _ARTIFACT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _FIELDS = (
     "shared_pre_router_residual",
     "topk_indices",
@@ -25,6 +26,8 @@ class ReconstructionDrain:
         *,
         output_dir: str,
         process_index: int,
+        run_id: str,
+        calibration_run_sha256: str,
         max_tokens: int,
         initial_tokens: int = 0,
         max_pending: int = 2,
@@ -36,10 +39,16 @@ class ReconstructionDrain:
             or initial_tokens > max_tokens
         ):
             raise ValueError("process_index/token limits are invalid")
+        if not _ARTIFACT_ID.fullmatch(run_id) or not _SHA256.fullmatch(
+            calibration_run_sha256
+        ):
+            raise ValueError("reconstruction artifact lineage is invalid")
         if max_pending != 2:
             raise ValueError("the reconstruction contract requires double buffering")
         self.output_dir = output_dir
         self.process_index = process_index
+        self.run_id = run_id
+        self.calibration_run_sha256 = calibration_run_sha256
         self.max_tokens = max_tokens
         self.tokens_submitted = initial_tokens
         self._executor = ThreadPoolExecutor(
@@ -90,6 +99,8 @@ class ReconstructionDrain:
                 _write_artifact,
                 self.output_dir,
                 self.process_index,
+                self.run_id,
+                self.calibration_run_sha256,
                 bucket,
                 artifact_id,
                 take,
@@ -128,6 +139,8 @@ class ReconstructionDrain:
 def _write_artifact(
     output_dir: str,
     process_index: int,
+    run_id: str,
+    calibration_run_sha256: str,
     bucket: str,
     artifact_id: str,
     tokens: int,
@@ -155,6 +168,8 @@ def _write_artifact(
         raise ValueError("reconstruction weights must use float16")
     metadata = {
         "schema_version": 1,
+        "run_id": run_id,
+        "calibration_run_sha256": calibration_run_sha256,
         "bucket": bucket,
         "artifact_id": artifact_id,
         "process_index": process_index,

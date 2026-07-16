@@ -4,7 +4,10 @@ Owner: Claude (spec). Implementation lands with the trainer. All shapes from
 the verified audit (`reference/upstream/README.md`). Assumes the requested
 v4-64 slice: 32 chips (v4 megacore exposes ~1 device/chip), likely 8 hosts ×
 4 local devices — **both numbers are verified by readiness test #1, not
-assumed**; every mesh below is parameterized on the measured counts.
+assumed**. The committed production router/recovery/full configs are an exact
+32-device profile. A different grant needs a freshly reviewed, source-bound
+production config; only the Stage-0.5 renderer currently adapts its topology
+and one-example-per-device batch to the measured slice.
 
 ## Memory ground truth (bf16 weights)
 
@@ -20,15 +23,26 @@ Per-chip HBM (v4): 32 GB.
 Student replicated, batch sharded. Simplest correct thing first:
 
 - Mesh: `('data',)` = all 32 devices.
-- Every parameter: `P()` (replicated; 16.2 GB/device leaves ~14 GB for
-  activations, LoRA/router optimizer state, and prefix caches).
+- Every parameter: `P()` (replicated; 16.2 GB/device before activations,
+  gradients, logits, LoRA/router optimizer state, and prefix caches).
 - Batch dims: `P('data')`. Loader delivers `global_batch/process_count`
   per host (see `reference/tpu-docs/data-loading.md`).
 - LoRA/router trainable states are MBs — replicated with the base.
+- The in-step gradient metric filters the gradient tree to the exact trainable
+  LoRA or router leaves before numerical use. Together with Kauldron's
+  partial-update mask, this lets XLA eliminate the frozen ~16.2 GB gradient
+  outputs instead of keeping a second model-sized tree live.
+- Recovery (`lora`) uses the pinned upstream Gemma `Block.__call__`
+  rematerialization boundary with `nothing_saveable`; full training uses the
+  same boundary. Smoke/router stay un-rematerialized so the readiness run
+  measures the simpler path.
 
 Rationale: no all-to-alls, no gather latency, trivially correct collectives;
-at 3.1B-active the arithmetic intensity is already good. We do not spend
-engineering on model parallelism the memory budget doesn't require.
+at 3.1B-active the arithmetic intensity is already good. This is a candidate,
+not a paper memory proof: Gate 4 must record a real update and HBM telemetry,
+and the K=4 recovery pilot must close separately before a long run. If either
+does not fit, use the Phase-B sharded policy or a newly reviewed lower
+batch/noise-draw profile rather than relaxing the gate.
 
 ## Teacher (trace generation / online distillation) — must shard
 
@@ -48,7 +62,8 @@ engineering on model parallelism the memory budget doesn't require.
 AdamW fp32 (m, v) + fp32 master ≈ 97 GB of state → FSDP:
 
 - Mesh: `('data',)` = 32; shard params + optimizer along it.
-- **The student's expert count equals the device count**: expert tensors
+- **In the committed 32-device profile the student's expert count equals the
+  device count**: expert tensors
   shard `P('data')` on dim 0 → exactly one expert (357 MB) + its optimizer
   state per device. No padding, no uneven shards.
 - Dense 2D weights `[out, in]`: `P('data', None)` on dim 0 (row sharding);
@@ -75,7 +90,8 @@ replicated by design and cannot substitute for that proof.
 
 ## Open questions (answered by the gauntlet, not by assumption)
 
-1. v4 megacore: is `jax.device_count()` 32 or 64 on this slice? (Affects
-   axis sizes only; specs are count-parameterized.)
+1. Does the allocation measure exactly the committed 32 global devices? If
+   not, Stage-0.5 is re-rendered for the measured slice and production remains
+   blocked on a new reviewed profile.
 2. Host count / local device count (8×4 assumed).
 3. Teacher all-to-all cost at (8,4) vs (4,8) — measured in the trace pilot.

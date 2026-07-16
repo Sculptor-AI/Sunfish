@@ -8,6 +8,10 @@ import jax
 from kauldron import konfig
 
 from sunfish_tpu.training.runtime import ensure_run_identity
+from sunfish_tpu.training.hbm_policy import (
+    rematerialize_transformer_blocks,
+    trainable_gradient_globs,
+)
 from sunfish_tpu.training.spec import (
     CheckpointFormat,
     HarnessConfig,
@@ -26,6 +30,7 @@ with konfig.imports():
     from sunfish_tpu.training import checkpoint as sunfish_checkpoint
     from sunfish_tpu.training import data as sunfish_data
     from sunfish_tpu.training import losses as sunfish_losses
+    from sunfish_tpu.training import metrics as sunfish_metrics
     from sunfish_tpu.training import model as sunfish_model
     from sunfish_tpu.training import prefix_amortized
     from sunfish_tpu.training import readiness_writer as sunfish_readiness
@@ -68,6 +73,9 @@ def get_config():
         dtype=spec.model.dtype,
         use_lora=use_lora,
         lora_rank=spec.optimizer.lora_rank,
+        rematerialize_blocks=rematerialize_transformer_blocks(
+            spec.run.phase.value
+        ),
     )
     corruption_process = hd.corruption.CategoricalProcess.uniform_process(
         num_categories=spec.model.vocab_size,
@@ -128,12 +136,20 @@ def get_config():
             weight=spec.objective.encoder_loss_weight,
         ),
     }
-    cfg.train_metrics = {
-        "gradient_norm": kd.metrics.TreeReduce(
+    gradient_globs = trainable_gradient_globs(spec.run.phase.value)
+    if gradient_globs is None:
+        gradient_norm = kd.metrics.TreeReduce(
             metric=kd.metrics.Norm(
                 tensor="grads", axis=None, aggregation_type="concat"
             )
-        ),
+        )
+    else:
+        gradient_norm = sunfish_metrics.SelectedTreeNorm(
+            tree="grads",
+            include=gradient_globs,
+        )
+    cfg.train_metrics = {
+        "gradient_norm": gradient_norm,
         "update_norm": kd.metrics.TreeReduce(
             metric=kd.metrics.Norm(
                 tensor="updates", axis=None, aggregation_type="concat"
@@ -208,7 +224,7 @@ def get_config():
         num_epochs=None,
         batch_drop_remainder=True,
         num_workers=spec.data.num_workers,
-        per_worker_buffer_size=2,
+        per_worker_buffer_size=sunfish_data.GRAIN_PREFETCH_BATCHES_PER_WORKER,
         shard_by_process=True,
         enable_profiling=readiness_enabled,
     )
@@ -223,7 +239,7 @@ def get_config():
             step=spec.checkpoint.init_step,
             model_param_path=spec.checkpoint.model_param_path,
         )
-    cfg.checkpointer = kd.ckpts.Checkpointer(
+    cfg.checkpointer = sunfish_checkpoint.ResumableCheckpointer(
         fast=False,
         never_save_step_zero=True,
         save_interval_steps=spec.training.checkpoint_every_steps,

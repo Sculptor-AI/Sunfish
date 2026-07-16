@@ -4,12 +4,62 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import functools
 from typing import Any
 
+from etils import epath
 import flax
 import jax
 from kauldron import kd
+from kauldron.checkpoints import lazy_checkpoint_manager
 import orbax.checkpoint as ocp
+
+
+@dataclasses.dataclass(frozen=True, eq=True, kw_only=True)
+class ResumableCheckpointer(kd.ckpts.Checkpointer):
+    """Kauldron checkpointer that removes abandoned Orbax temp directories.
+
+    Orbax leaves a temporary step directory behind when an asynchronous save
+    is interrupted.  Kauldron 1.4.4 does not expose
+    ``CheckpointManagerOptions.cleanup_tmp_directories`` and leaves its
+    default disabled, so restarting the same immutable attempt can collide
+    with the abandoned directory.  This class intentionally mirrors the
+    pinned Kauldron 1.4.4 manager construction with that one safety option
+    enabled.  ``sunfish-runtime-api-audit`` guards the upstream constructor
+    contract before any accelerator backend is initialized.
+    """
+
+    @functools.cached_property
+    def _ckpt_mgr(self) -> lazy_checkpoint_manager.LazyCheckpointManager:
+        def _best_fn(metrics):
+            return kd.kontext.get_by_path(metrics, self.best_metric_path)
+
+        manager_options = ocp.CheckpointManagerOptions(
+            save_interval_steps=self.save_interval_steps,
+            lightweight_initialize=self.lightweight_initialize,
+            max_to_keep=(
+                self.max_to_keep if self.preservation_policy is None else None
+            ),
+            keep_time_interval=self.keep_time_interval,
+            keep_period=self.keep_period,
+            save_on_steps=self.save_on_steps,
+            best_fn=_best_fn if self.best_metric_path is not None else None,
+            best_mode=self.best_mode,
+            step_prefix="ckpt",
+            create=self.create,
+            cleanup_tmp_directories=True,
+            async_options=ocp.AsyncOptions(timeout_secs=60 * 30),
+            multiprocessing_options=self.multiprocessing_options,
+            preservation_policy=self.preservation_policy,
+            file_options=ocp.checkpoint_manager.FileOptions(
+                path_permission_mode=0o770,
+            ),
+        )
+        return lazy_checkpoint_manager.LazyCheckpointManager(
+            directory=epath.Path(self.workdir) / "checkpoints",
+            options=manager_options,
+            fast=self.fast,
+        )
 
 
 @dataclasses.dataclass(frozen=True)

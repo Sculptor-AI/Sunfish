@@ -1,6 +1,7 @@
 import contextlib
 import io
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -45,7 +46,58 @@ class TrainingLauncherTests(unittest.TestCase):
         self.assertEqual(forwarded[forwarded.index("--expected-devices") + 1], "0")
         self.assertEqual(configured_path, str(SMOKE.resolve()))
         self.assertEqual(allow_non_tpu, "1")
-        self.assertTrue(any(arg.endswith("configs/training/sunfish.py") for arg in forwarded))
+        self.assertIn(
+            f"--cfg={Path(train.__file__).resolve().with_name('kauldron_config.py')}",
+            forwarded,
+        )
+
+    def test_noneditable_wheel_resolves_config_inside_installed_package(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = (
+                root
+                / "venv/lib/python3.12/site-packages/sunfish_tpu/training"
+            )
+            package.mkdir(parents=True)
+            installed_train = package / "train.py"
+            installed_train.touch()
+            installed_config = package / "kauldron_config.py"
+            installed_config.touch()
+            expected_config = installed_config.resolve()
+            outside_checkout = root / "outside-checkout"
+            outside_checkout.mkdir()
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(outside_checkout)
+                with (
+                    mock.patch.object(train, "__file__", str(installed_train)),
+                    mock.patch.object(train.kauldron_launch, "main") as launch,
+                    contextlib.redirect_stdout(io.StringIO()),
+                    mock.patch.dict(os.environ, {}, clear=False),
+                ):
+                    train.main(["--config", str(SMOKE), "--allow-non-tpu"])
+            finally:
+                os.chdir(previous_cwd)
+
+        forwarded = launch.call_args.args[0]
+        self.assertIn(f"--cfg={expected_config}", forwarded)
+        self.assertNotIn(str(ROOT / "configs/training/sunfish.py"), forwarded)
+
+    def test_packaged_config_must_be_a_regular_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            package = Path(temporary) / "site-packages/sunfish_tpu/training"
+            package.mkdir(parents=True)
+            installed_train = package / "train.py"
+            installed_train.touch()
+            with mock.patch.object(train, "__file__", str(installed_train)):
+                with (
+                    self.assertRaisesRegex(FileNotFoundError, "config is missing"),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    train.main(["--config", str(SMOKE), "--validate-only"])
+                (package / "kauldron_config.py").mkdir()
+                with self.assertRaisesRegex(RuntimeError, "not a regular file"):
+                    train._packaged_kauldron_config_path()
 
     def test_konfig_overrides_are_refused(self):
         with self.assertRaisesRegex(SystemExit, "run-identity"):

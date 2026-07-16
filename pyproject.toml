@@ -68,6 +68,7 @@ sunfish-render-tpu-configs = "sunfish_tpu.deployment_config:main"
 sunfish-reconstruction-gate = "sunfish_tpu.reconstruction_gate:main"
 sunfish-runtime-api-audit = "sunfish_tpu.runtime_api_audit:main"
 sunfish-seed-load-smoke = "sunfish_tpu.seed_load_smoke:main"
+sunfish-stage1-data-inventory = "sunfish_tpu.calibration_data_inventory:main"
 sunfish-train = "sunfish_tpu.training.train:main"
 sunfish-tpu-preflight = "sunfish_tpu.tpu_preflight:main"
 

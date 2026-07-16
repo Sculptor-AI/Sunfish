@@ -53,6 +53,9 @@ case "${operation}" in
       --worker=all \
       --batch-size=all \
       --tunnel-through-iap \
+      --ssh-flag=-oServerAliveInterval=30 \
+      --ssh-flag=-oServerAliveCountMax=6 \
+      --ssh-flag=-oTCPKeepAlive=yes \
       --command "${command}"
     ;;
   scp-all)

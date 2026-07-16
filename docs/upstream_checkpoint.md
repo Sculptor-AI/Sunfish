@@ -2,8 +2,9 @@
 
 This file freezes the metadata assumptions used by the Stage 0 converter. It
 was checked against the public metadata for
-`google/diffusiongemma-26B-A4B-it` on 2026-07-10. The full gated weight shards
-were not downloaded during this audit.
+`google/diffusiongemma-26B-A4B-it` on 2026-07-10. The full 11-shard snapshot
+was subsequently downloaded and its 1,047 safetensors headers were reconciled
+exactly with `reference/upstream/audit.json`.
 
 ## Published metadata snapshot
 
@@ -11,7 +12,8 @@ were not downloaded during this audit.
 | --- | ---: |
 | Safetensors shards | 11 |
 | Indexed tensors | 1,047 |
-| Materialized parameters | 25,823,778,864 |
+| Published index `total_parameters` | 25,823,778,864 |
+| Header-materialized parameters (canonical) | 25,823,781,228 |
 | Weight bytes | 51,647,562,456 |
 | Decoder layers | 30 |
 | Routed experts per layer | 128 |
@@ -29,8 +31,10 @@ model.safetensors.index.json
 ```
 
 These hashes identify the audited metadata, not the 11 weight shards. The
-downloaded checkpoint must still be audited from its actual safetensors
-headers before conversion.
+header sum is 2,364 parameters above the index's `total_parameters`, but it
+matches `total_size / 2` exactly for the BF16 checkpoint. Header shapes are
+canonical for conversion and model-budget math; the index discrepancy is
+recorded upstream metadata, not a Sunfish correction.
 
 ## Tensor-name contract
 
@@ -63,8 +67,9 @@ the strict Hugging Face config; conversion details live in
 
 ## Required control sequence
 
-1. Audit all downloaded shard headers and compare the reported totals with the
-   published index.
+1. Audit all downloaded shard headers against `reference/upstream/audit.json`;
+   require the canonical 25,823,781,228 header sum and the separately recorded
+   2,364-parameter index discrepancy.
 2. Convert 128 experts / Top-8 with text-only mode. Untouched text tensors must
    remain byte-identical.
 3. Load upstream and control implementations and compare seeded text logits
