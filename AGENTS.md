@@ -76,6 +76,10 @@ starts it, note it here.
 
 ## Decision log (newest first)
 
+- 2026-07-16: **OpenCode registered as third wire agent (id `O`).** Runs
+  Kimi K3 via OpenCode Go (`opencode run --auto`, warm-lane resume via
+  `sessionID`). Note: unlike Codex's workspace-write sandbox, `--auto` is
+  unsandboxed — treat `do:` requests to O accordingly. Human-approved.
 - 2026-07-13: **TPU workers are air-gapped and IAP-only.** Worker bootstrap
   may not reach PyPI, GitHub, Hugging Face, or any public package/model
   endpoint. A connected Linux host builds the immutable offline release;

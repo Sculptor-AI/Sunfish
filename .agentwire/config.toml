@@ -15,3 +15,12 @@ cmd = ["codex", "exec", "--json", "--skip-git-repo-check", "--cd", "{root}", "--
 # Warm-lane resume per coordination/codex-wire-cost.md; rotated after 8 uses.
 session_cmd = ["codex", "exec", "resume", "--json", "--skip-git-repo-check", "{session}", "{message}"]
 session_regex = '"thread_id"\s*:\s*"([^"]+)"' 
+
+[agents.opencode]
+id = "O"
+# OpenCode Go running Kimi K3. --auto approves tool use (no sandbox, unlike
+# codex's workspace-write) — same trust boundary caveat as the rest of this file.
+cmd = ["opencode", "run", "--format", "json", "--auto", "-m", "opencode-go/kimi-k3", "--dir", "{root}", "{message}"]
+# Warm-lane resume: -s continues the prior session (model is remembered).
+session_cmd = ["opencode", "run", "--format", "json", "--auto", "-m", "opencode-go/kimi-k3", "--dir", "{root}", "-s", "{session}", "{message}"]
+session_regex = '"sessionID"\s*:\s*"([^"]+)"'
