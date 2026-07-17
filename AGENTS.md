@@ -76,6 +76,16 @@ starts it, note it here.
 
 ## Decision log (newest first)
 
+- 2026-07-17: **Browser-agent training slice added to the SFT plan (~10%).**
+  Carved from repo-agent 25→22, terminal 10→8, MCP 15→12, edits 15→13 in
+  `docs/data.md`. Sources: WebLINX + Mind2Web + NNetNav backbone, audited
+  AgentTrek/Synatra filler (500-trace audit, same bar as Open-SWE-Traces).
+  Text-only contract: pruned accessibility-tree observations with stable
+  element IDs, browser actions in the one canonical tool grammar, page
+  observations prefix-only. Stage-6 browser rejection sampling (BrowserGym/
+  WebArena) is conditional on the harness not delaying the SWE/terminal
+  gate; browser RL is deferred from v1. Browser evals informational, not
+  release-gating. Chase-approved; Codex review requested (wire seq 75).
 - 2026-07-16: **OpenCode registered as third wire agent (id `O`).** Runs
   Kimi K3 via OpenCode Go (`opencode run --auto`, warm-lane resume via
   `sessionID`). Note: unlike Codex's workspace-write sandbox, `--auto` is

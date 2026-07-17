@@ -146,7 +146,9 @@ Extend with long-context annealing only if probes fail.
 ### Stage 5 — SFT (TPU, 200-500M tokens)
 
 Mix per `docs/data.md`: OpenCodeInstruct + Toucan-1.5M backbones, SWE-smith/
-SWE-Lego/R2E-Gym trajectories, CommitPackFT + aider-style edit formats,
+SWE-Lego/R2E-Gym trajectories, browser-agent trajectories (WebLINX/Mind2Web/
+NNetNav over DOM/accessibility-tree observations — text-only, same canonical
+tool grammar; decision 2026-07-17), CommitPackFT + aider-style edit formats,
 thinking-mode control (on/off/budgeted), canvas-boundary packing, full
 decontamination. Includes **slot-corruption training** for structured
 denoising (research agenda T1.2) so grammar-locked decoding has been trained
@@ -158,7 +160,10 @@ for, not bolted on.
 
 Two passes: k rollouts per task in real environments (SWE-smith, terminal,
 MCP-simulated), keep verified successes, retrain, difficulty-filter between
-passes.
+passes. Browser environments (BrowserGym/WebArena, rule-based verifiers) are
+**conditional**: include them only if the containerized browser harness lands
+without delaying the SWE/terminal harness gate; browser RL in stage 7 is
+deferred from v1 either way.
 **Gate:** monotone improvement on gate evals; harness (sandboxing, verifiers,
 trajectory logging) fully debugged here, before RL needs it.
 

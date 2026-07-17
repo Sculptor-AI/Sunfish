@@ -85,13 +85,18 @@ separately.
 
 | Loss-bearing SFT slice | Source | Share |
 | --- | --- | --- |
-| Verified repo-agent trajectories | Hierarchy below | 25% |
-| Terminal-agent trajectories | Nemotron Terminal Corpus (~366k execution trajectories), deduped by seed/generator; Terminal-Harbor eval templates disjoint | 10% |
-| MCP/function/tool calling | Toucan-1.5M backbone (real MCP servers); Nemotron-SFT-Agentic-v2 subset (dedup vs Toucan) + xlam-60k supplements | 15% |
-| Standalone edits / diffs | CommitPackFT + aider-style search/replace and unified-diff formats | 15% |
+| Verified repo-agent trajectories | Hierarchy below | 22% |
+| Terminal-agent trajectories | Nemotron Terminal Corpus (~366k execution trajectories), deduped by seed/generator; Terminal-Harbor eval templates disjoint | 8% |
+| MCP/function/tool calling | Toucan-1.5M backbone (real MCP servers); Nemotron-SFT-Agentic-v2 subset (dedup vs Toucan) + xlam-60k supplements | 12% |
+| Browser-agent trajectories | Hierarchy below (WebLINX / Mind2Web / NNetNav backbone; audited synthetic filler) | 10% |
+| Standalone edits / diffs | CommitPackFT + aider-style search/replace and unified-diff formats | 13% |
 | Code instructions | OpenCodeInstruct backbone; Magicoder OSS-Instruct supplement | 20% |
 | General chat | SmolTalk / Tulu-3 sample (floor, not filler — agents need instruction following and sane failure messages) | 10% |
 | Bounded reasoning | Short-form math/logic with capped thinking | 5% |
+
+(Decision 2026-07-17: the browser slice was carved out of repo-agent 25→22,
+terminal 10→8, MCP 15→12, and edits 15→13 — coding slices stay the majority;
+browser capability is additive, not the headline.)
 
 **Repo-trajectory slice composition** (within the 25%): ~35% SWE-Lego (quality
 anchor: 18k validated trajectories, 3k+ repos; adopt its step-level error
@@ -104,6 +109,33 @@ boilerplate; cap regardless of raw size), ~10% SWE-Gym (small real-task gold
 anchor), ~5% verified R2E-Gym successes (its failures go to verifier/
 preference data, never imitation loss). Cap any single teacher, repository
 family, or harness at ~one third of the slice.
+
+**Browser-trajectory slice composition** (within the 10%): ~35% WebLINX
+(~100k turns of real-website conversational navigation over pruned DOM — the
+volume backbone), ~25% Mind2Web train split (real-site quality anchor;
+DOM-grounded actions), ~20% NNetNav (permissively licensed, accessibility-
+tree-native, self-supervised exploration), ~20% AgentTrek/Synatra synthesized
+trajectories — **audit 500 random traces first** (same bar as
+Open-SWE-Traces: action faithfulness to the page state, task completion,
+teacher boilerplate) and cap regardless of raw size. Weight toward developer
+and productivity workflows (GitHub/GitLab, documentation, issue trackers,
+package research, dashboards, forms/tables) over consumer browsing where the
+sources allow. Same teacher/site-family/harness cap as the repo slice.
+
+Browser constraints, over and above the canonical-grammar rule below:
+
+- **Text-only observations.** Sunfish ships without the vision tower, so the
+  browser contract is DOM/accessibility-tree based: one canonical pruned
+  accessibility-tree observation format with stable element IDs, converters
+  per source dataset. No screenshots; no coordinate-based actions in v1.
+- Browser actions (`navigate`, `click`, `type`, `scroll`, `extract_text`,
+  `go_back`, …) render into the **same** MCP/OpenAI-style grammar as every
+  other tool — a browser action is one atomic tool call in one canvas.
+- Page observations are exogenous state: **prefix-only, never denoised**,
+  exactly like tool observations in the diffusion-formatting rules below.
+- Expected v1 level is DOM-based navigation at moderate reliability with a
+  supportive harness (stable IDs, retries, loop detection) — not long-horizon
+  autonomous browsing. That claim stays out of release messaging.
 
 **One canonical action grammar.** Normalize all harness formats
 (OpenHands, SWE-agent, ReAct) through an ADP-style intermediate representation
@@ -167,7 +199,11 @@ whether thinking-on earns its latency on coding tasks.
   issue/PR identity, base-commit ancestry, patch hash + normalized AST diff,
   test/failure signatures, and semantic issue similarity. Targets:
   HumanEval/HumanEval+, MBPP/MBPP+, BigCodeBench, LiveCodeBench (post-cutoff
-  windows preferred anyway), SWE-bench Verified, Aider polyglot.
+  windows preferred anyway), SWE-bench Verified, Aider polyglot. Browser
+  additions: Mind2Web test splits (cross-task/-website/-domain), the
+  WebArena/VisualWebArena task sets, and WebLINX eval splits — keyed on
+  site + task template + action sequence, since the same task recurs across
+  browser datasets under different renderings.
 - Maintain a **repo-and-time-disjoint sentinel eval set** that stays out of
   every training AND selection loop, alongside the held-out BFCLv3 and
   MCP-Universe.
@@ -186,6 +222,9 @@ apply?), tool-call JSON validity rate.
 Expensive tier (candidate gates): BigCodeBench, LiveCodeBench, Aider polyglot
 edit benchmark, SWE-bench Verified subset (50-100 instances through the agent
 harness), end-to-end tokens/second and time-to-first-canvas on the RTX 5080.
+Browser (informational in v1, not release-gating): Mind2Web held-out step
+accuracy; a WebArena-Lite subset through the browser harness only if the
+stage-6 BrowserGym harness lands.
 
 The release claim to defend is "fast *and* usable for real coding agents", so
 the edit-format validity and SWE-bench-subset numbers gate the release, not
