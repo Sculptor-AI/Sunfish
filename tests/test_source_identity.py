@@ -35,7 +35,7 @@ class SourceIdentityTests(unittest.TestCase):
         self.assertRegex(digest, r"^[0-9a-f]{64}$")
         self.assertGreater(int(count), 75)
 
-    def test_digest_covers_content_and_mode_but_ignores_ignored_files(self):
+    def test_digest_covers_content_and_executable_bit_but_ignores_other_modes(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             subprocess.run(["git", "init", "-q", str(root)], check=True)
@@ -60,9 +60,15 @@ class SourceIdentityTests(unittest.TestCase):
             )
             self.assertEqual(source_tree_digest(root), (initial, initial_count))
 
+            tracked.chmod(0o664)
+            self.assertEqual(source_tree_digest(root), (initial, initial_count))
+
             tracked.chmod(0o755)
             mode_changed, _ = source_tree_digest(root)
             self.assertNotEqual(mode_changed, initial)
+
+            tracked.chmod(0o775)
+            self.assertEqual(source_tree_digest(root), (mode_changed, initial_count))
 
             tracked.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
             content_changed, _ = source_tree_digest(root)

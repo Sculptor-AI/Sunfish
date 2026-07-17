@@ -1,6 +1,7 @@
 import json
 import hashlib
 import os
+from contextlib import contextmanager
 from pathlib import Path
 import shlex
 import subprocess
@@ -31,6 +32,15 @@ from sunfish_tpu.training.dependencies import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@contextmanager
+def temporary_umask(mask: int):
+    previous = os.umask(mask)
+    try:
+        yield
+    finally:
+        os.umask(previous)
 
 
 def make_exported_source(root: Path) -> dict[str, object]:
@@ -260,6 +270,47 @@ class OfflineBundleTests(unittest.TestCase):
             packed = pack_bundle(bundle, archive)
             self.assertEqual(read_archive_sidecar(archive), packed["sha256"])
             self.assertGreater(archive.stat().st_size, 0)
+
+    def test_pack_extract_verify_is_portable_across_builder_and_controller_umasks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            controller_source = root / "controller" / "source"
+            with temporary_umask(0o022):
+                make_exported_source(controller_source)
+            controller_identity = workspace_source_identity(controller_source)
+
+            with temporary_umask(0o002):
+                bundle = self._bundle(root / "builder")
+            builder_source = bundle / "source"
+            self.assertEqual(
+                (controller_source / "src/example.py").stat().st_mode & 0o777,
+                0o644,
+            )
+            self.assertEqual(
+                (builder_source / "src/example.py").stat().st_mode & 0o777,
+                0o664,
+            )
+
+            archive = root / "release.tar"
+            pack_bundle(bundle, archive)
+            destination = root / "worker"
+            destination.mkdir()
+            extracted = standalone_runtime.extract_bundle_archive(
+                archive, destination
+            )
+            self.assertEqual(
+                extracted, destination / "sunfish-tpu-offline"
+            )
+            self.assertEqual(
+                (extracted / "source/src/example.py").stat().st_mode & 0o777,
+                0o664,
+            )
+            report = verify_bundle(
+                extracted,
+                expected_commit=controller_identity["git_commit"],
+                expected_tree=controller_identity["source_tree_sha256"],
+            )
+            self.assertEqual(report["sunfish_source"], controller_identity)
 
     def test_resolved_lock_rejects_urls_and_markers(self):
         with tempfile.TemporaryDirectory() as temporary:

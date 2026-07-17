@@ -331,3 +331,19 @@ IAP, IAM, bucket, and topology facts must replace the job template; the exact
 reviewed Stage-1 corpus receipt must exist; and the ordered eight-gate ledger
 must pass on the actual slice. Until then the production training launch is a
 no-go.
+
+**Final verify-lane repair complete (Codex, 2026-07-16):** the two confirmed
+findings in `coordination/verify_findings_2026-07-16.md` are repaired locally.
+Source identity now canonicalizes each deployment entry to Git's executable
+bit (`0755` or `0644`), and a real pack -> deploy-extractor -> `verify_bundle`
+regression proves that a `0664` umask-002 builder tree matches the equivalent
+`0644` umask-022 controller tree after extraction. The host-log relay now
+stages the complete PID in the ready file's directory and atomically renames
+it into place; its entrypoint still rejects any observed mismatch immediately.
+The stable local tree passes **346 tests with 25 intentional heavy-stack
+skips**, the release-safety policy, all 15 shell syntax checks, targeted
+bytecode compilation, and `git diff --check`. No recorded real source-tree
+digest expectation existed elsewhere in the repository, so none was updated;
+synthetic test placeholders are unchanged. No TPU, bucket, deployment, or
+other cloud state was touched. Because the source identity changed, the repair
+must be committed and frozen before any offline bundle build.

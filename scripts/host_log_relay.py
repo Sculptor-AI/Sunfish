@@ -15,6 +15,7 @@ import os
 import select
 import stat
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -64,11 +65,24 @@ def _open_log(path: Path) -> int:
 
 
 def _create_ready(path: Path) -> None:
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    if path.exists() or path.is_symlink():
+        raise FileExistsError(f"host log relay ready path already exists: {path}")
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary_path = Path(temporary_name)
     try:
-        os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+        try:
+            _write_all(fd, f"{os.getpid()}\n".encode("ascii"))
+        finally:
+            os.close(fd)
+        if path.exists() or path.is_symlink():
+            raise FileExistsError(
+                f"host log relay ready path already exists: {path}"
+            )
+        os.rename(temporary_path, path)
     finally:
-        os.close(fd)
+        temporary_path.unlink(missing_ok=True)
 
 
 def _stop_requested(path: Path) -> bool:

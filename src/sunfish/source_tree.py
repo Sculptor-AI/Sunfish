@@ -147,7 +147,10 @@ def _digest_source_names(root: Path, names: list[bytes]) -> tuple[str, int]:
             payload = path.read_bytes()
         else:
             raise RuntimeError(f"source entry is not a file or symlink: {name}")
-        mode = path.lstat().st_mode & 0o777
+        # Git records only whether an entry is executable, not checkout-local
+        # read/write bits inherited from the host umask. Encode that one bit
+        # canonically so equivalent 0644/0664 and 0755/0775 trees agree.
+        mode = 0o755 if path.lstat().st_mode & 0o100 else 0o644
         digest.update(len(raw_name).to_bytes(8, "little"))
         digest.update(raw_name)
         digest.update(kind)
