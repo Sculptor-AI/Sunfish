@@ -99,6 +99,15 @@ PYTHONPATH=src "${PYTHON_BIN}" -m sunfish_tpu.offline_bundle export-source \
   --no-deps \
   "${wheelhouse}"/promise-*.tar.gz "${wheelhouse}"/[Ss][Qq][Ll][Aa]lchemy-*.tar.gz
 rm "${wheelhouse}"/promise-*.tar.gz "${wheelhouse}"/[Ss][Qq][Ll][Aa]lchemy-*.tar.gz
+# A locally built native wheel is tagged bare linux_x86_64, which the audit
+# rightly rejects. The builder host's image matches the TPU workers (documented
+# above), so its glibc version is the honest manylinux compatibility bound.
+builder_glibc_tag="manylinux_$(ldd --version | awk 'NR==1{v=$NF; gsub(/\./, "_", v); print v}')_x86_64"
+"${PYTHON_BIN}" -m pip install --quiet wheel
+for built_native in "${wheelhouse}"/*-linux_x86_64.whl; do
+  [[ -e "${built_native}" ]] || continue
+  "${PYTHON_BIN}" -m wheel tags --platform-tag "${builder_glibc_tag}" --remove "${built_native}"
+done
 "${PYTHON_BIN}" -m pip wheel \
   --wheel-dir "${wheelhouse}" \
   --no-deps \
