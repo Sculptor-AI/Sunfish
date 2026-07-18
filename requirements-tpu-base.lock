@@ -17,3 +17,13 @@ numpy==2.4.6
 optax==0.2.8
 orbax-checkpoint==0.12.1
 sentencepiece==0.2.1
+
+# Gemma 4.1.0's declared runtime dependencies that the kauldron/JAX tree does
+# not already provide. Gemma itself is wheeled --no-deps from source (see
+# requirements-gemma-source.lock); these make the offline environment satisfy
+# its metadata so the no-index audit's pip check passes.
+bagz==0.2.0
+fastmcp==3.4.4
+kaggle==2.2.3
+sacrebleu==2.6.0
+seqio==0.0.20
