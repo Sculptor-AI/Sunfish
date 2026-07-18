@@ -132,6 +132,51 @@ def require_unchanged_source_inventory(
         )
 
 
+def _unwrap_checkpoint_w_wrappers(nested: Any) -> Any:
+    """Collapse the checkpoint's Linen-Dense ``{'w': leaf}`` wrappers.
+
+    Measured against the official gs://gemma-data checkpoint (2026-07-18):
+    exactly 62 leaves — ``layer_*.mlp2.gating_einsum``, ``layer_*.mlp2.linear``
+    (30 each), and ``self_conditioner.ffw.{gating_einsum,linear}`` — are stored
+    one level deeper (``.w``) than the trainer's Linen model tree materializes
+    them. Stripping the wrapper at exactly those paths makes the checkpoint and
+    model trees identical. The unwrap is scoped and asserted: any deviation
+    from the sole-key ``{'w': leaf}`` shape at these paths is an error, never
+    silently tolerated.
+    """
+    import re as _re
+
+    def unwrap(module: dict, name: str, where: str) -> None:
+        node = module.get(name)
+        if not isinstance(node, dict) or set(node) != {"w"}:
+            raise ValueError(
+                f"expected a sole-key 'w' wrapper at {where}.{name}; "
+                f"found {type(node).__name__} with keys "
+                f"{sorted(node) if isinstance(node, dict) else 'n/a'}"
+            )
+        module[name] = node["w"]
+
+    result = dict(nested)
+    for key, value in result.items():
+        if _re.fullmatch(r"layer_\d+", key) and isinstance(value, dict):
+            mlp2 = value.get("mlp2")
+            if isinstance(mlp2, dict):
+                value = dict(value)
+                value["mlp2"] = mlp2 = dict(mlp2)
+                unwrap(mlp2, "gating_einsum", f"{key}.mlp2")
+                unwrap(mlp2, "linear", f"{key}.mlp2")
+                result[key] = value
+        elif key == "self_conditioner" and isinstance(value, dict):
+            ffw = value.get("ffw")
+            if isinstance(ffw, dict):
+                value = dict(value)
+                value["ffw"] = ffw = dict(ffw)
+                unwrap(ffw, "gating_einsum", "self_conditioner.ffw")
+                unwrap(ffw, "linear", "self_conditioner.ffw")
+                result[key] = value
+    return result
+
+
 def classify_prunable_path(path: Sequence[str]) -> PrunableLeaf | None:
     """Recognize nested Gemma 4 MoE leaves, with or without trailing ``w``."""
     layer = None
@@ -446,6 +491,7 @@ def materialize_orbax_seed(
         selection_layers_sha256=selection_snapshot.layers_sha256,
     )
     del source_params
+    pruned_nested = _unwrap_checkpoint_w_wrappers(pruned_nested)
     pruned_signature = _tree_signature(pruned_nested, flax)
     require_parameter_count(
         pruned_signature,
