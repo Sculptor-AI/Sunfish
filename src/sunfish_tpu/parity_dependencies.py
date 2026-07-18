@@ -6,7 +6,7 @@ PARITY_RUNTIME_VERSIONS = {
     "numpy": "2.5.1",
     "safetensors": "0.8.0",
     "sentencepiece": "0.2.2",
-    "tokenizers": "0.23.0",
+    "tokenizers": "0.22.2",
     "torch": "2.13.0",
     "transformers": "5.13.0",
 }
