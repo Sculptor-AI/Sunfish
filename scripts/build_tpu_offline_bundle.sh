@@ -86,16 +86,19 @@ PYTHONPATH=src "${PYTHON_BIN}" -m sunfish_tpu.offline_bundle export-source \
 "${PYTHON_BIN}" -m pip download \
   --dest "${wheelhouse}" \
   --only-binary=:all: \
-  --no-binary=promise \
+  --no-binary=promise,sqlalchemy \
   --requirement requirements-tpu-base.lock
-# promise (via kauldron -> tensorflow-datasets) publishes no wheel, only a
-# pure-Python sdist. Build its deterministic py3-none-any wheel here on the
-# connected builder; the sdist itself never enters the bundle.
+# Two transitive dependencies publish no usable wheel: promise (pure Python,
+# via kauldron -> tensorflow-datasets) and sqlalchemy 1.2.19 (hard-pinned by
+# every xmanager release; native extensions). Build those wheels here and drop
+# the sdists — nothing unbuilt enters the bundle. The sqlalchemy wheel is
+# ABI-bound to this builder's glibc, so the builder must run on a host whose
+# image matches the TPU workers (enforced operationally, per infra/tpu/README).
 "${PYTHON_BIN}" -m pip wheel \
   --wheel-dir "${wheelhouse}" \
   --no-deps \
-  "${wheelhouse}"/promise-*.tar.gz
-rm "${wheelhouse}"/promise-*.tar.gz
+  "${wheelhouse}"/promise-*.tar.gz "${wheelhouse}"/[Ss][Qq][Ll][Aa]lchemy-*.tar.gz
+rm "${wheelhouse}"/promise-*.tar.gz "${wheelhouse}"/[Ss][Qq][Ll][Aa]lchemy-*.tar.gz
 "${PYTHON_BIN}" -m pip wheel \
   --wheel-dir "${wheelhouse}" \
   --no-deps \
