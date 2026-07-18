@@ -46,7 +46,11 @@ _VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.!+_-]*$")
 _NORMALIZE_NAME = re.compile(r"[-_.]+")
 _MANYLINUX_TAG = re.compile(r"^manylinux_(\d+)_(\d+)_x86_64$")
 _GLIBC_VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+)+$")
-_BOOTSTRAP_DISTRIBUTIONS = {"pip", "setuptools"}
+# Only pip is a true bootstrap distribution (the installer itself, provided by
+# venv creation). setuptools is a declared runtime dependency of the TPU tree
+# (tensorflow et al.), so it must flow through the lock and wheelhouse like any
+# other resolved distribution.
+_BOOTSTRAP_DISTRIBUTIONS = {"pip"}
 _LEGACY_MANYLINUX_GLIBC = {
     "manylinux1_x86_64": (2, 5),
     "manylinux2010_x86_64": (2, 12),
