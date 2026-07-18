@@ -86,7 +86,16 @@ PYTHONPATH=src "${PYTHON_BIN}" -m sunfish_tpu.offline_bundle export-source \
 "${PYTHON_BIN}" -m pip download \
   --dest "${wheelhouse}" \
   --only-binary=:all: \
+  --no-binary=promise \
   --requirement requirements-tpu-base.lock
+# promise (via kauldron -> tensorflow-datasets) publishes no wheel, only a
+# pure-Python sdist. Build its deterministic py3-none-any wheel here on the
+# connected builder; the sdist itself never enters the bundle.
+"${PYTHON_BIN}" -m pip wheel \
+  --wheel-dir "${wheelhouse}" \
+  --no-deps \
+  "${wheelhouse}"/promise-*.tar.gz
+rm "${wheelhouse}"/promise-*.tar.gz
 "${PYTHON_BIN}" -m pip wheel \
   --wheel-dir "${wheelhouse}" \
   --no-deps \
