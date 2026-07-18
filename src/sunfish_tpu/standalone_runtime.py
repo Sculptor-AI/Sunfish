@@ -381,6 +381,11 @@ def _runtime_tree_identity(runtime_root: Path) -> dict[str, Any]:
             )
             if relative.as_posix() == RUNTIME_MARKER_NAME:
                 continue
+            if entry.name == "__pycache__" or entry.name.endswith(".pyc"):
+                # CPython bytecode caches are volatile: any legitimate run of the
+                # bundled interpreter may (re)write them, so they cannot be part
+                # of the immutable tree identity.
+                continue
             path = Path(entry.path)
             info = path.lstat()
             mode = stat.S_IMODE(info.st_mode)
@@ -420,7 +425,7 @@ def _run_runtime_probe(python: Path) -> dict[str, Any]:
         "},sort_keys=True))"
     )
     result = subprocess.run(
-        [str(python), "-I", "-c", program],
+        [str(python), "-I", "-B", "-c", program],
         check=True,
         capture_output=True,
         text=True,

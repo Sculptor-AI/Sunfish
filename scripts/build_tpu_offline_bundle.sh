@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 
 # CONNECTED LINUX BUILD HOST ONLY (Colab/Kaggle/Cloud Build/CPU VM).
 # TPU workers have no public egress and must never execute this script.
