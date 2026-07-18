@@ -39,6 +39,19 @@ SOURCE_EXPERTS = 128
 NUM_LAYERS = 30
 _AUDITED_BUDGET = DiffusionMoEBudget()
 AUDITED_SOURCE_TEXT_PARAMETERS = _AUDITED_BUDGET.source_text_parameters
+
+# Measured against the official gs://gemma-data JAX/Orbax checkpoint
+# (2026-07-18): the Linen tree does not materialize the per-layer layer_scalar
+# singletons that the safetensors export carries as separate tensors, and it
+# fuses/organizes several embedding, router, and vision leaves differently.
+# The net text-parameter difference versus the audited safetensors contract is
+# exactly -30 (25,250,986,782 observed vs 25,250,986,812 audited). Safetensors
+# headers remain canonical for all Sunfish math (AGENTS.md ground rule 5);
+# this constant only reconciles the redundant count pre-gates for JAX-format
+# trees, and equality is still enforced exactly. The binding structural gate is
+# the exact-tree trace + leaf-by-leaf reconciliation below, which this delta
+# does not touch.
+OFFICIAL_JAX_TREE_TEXT_DELTA = -30
 AUDITED_TARGET_TEXT_PARAMETERS_32E = int(
     _AUDITED_BUDGET.estimate(experts=32, top_k=4)["total_parameters"]
 )
@@ -366,7 +379,10 @@ def materialize_orbax_seed(
         raise ValueError(
             "approved production selection differs from materializer source lineage"
         )
-    expected_target_parameters = audited_target_text_parameters(retained_experts)
+    expected_target_parameters = (
+        audited_target_text_parameters(retained_experts)
+        + OFFICIAL_JAX_TREE_TEXT_DELTA
+    )
 
     # Heavy imports happen only after the laptop/RAM guard.
     import flax
@@ -417,7 +433,7 @@ def materialize_orbax_seed(
     source_signature = _tree_signature(source_params, flax)
     require_parameter_count(
         source_signature,
-        expected=AUDITED_SOURCE_TEXT_PARAMETERS,
+        expected=AUDITED_SOURCE_TEXT_PARAMETERS + OFFICIAL_JAX_TREE_TEXT_DELTA,
         label="official JAX text checkpoint",
     )
     pruned_nested, pruning = _prune_nested_params(
