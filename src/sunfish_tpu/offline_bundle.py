@@ -386,7 +386,10 @@ def _wheel_identity(path: Path) -> tuple[str, str]:
             metadata_files = [
                 name
                 for name in wheel.namelist()
-                if name.endswith(".dist-info/METADATA")
+                # Only the wheel's own root-level dist-info counts: wheels like
+                # setuptools and bleach legitimately vendor other projects'
+                # .dist-info/METADATA deeper inside their payload.
+                if name.endswith(".dist-info/METADATA") and name.count("/") == 1
             ]
             if len(metadata_files) != 1:
                 raise ValueError("wheel must contain exactly one METADATA file")
