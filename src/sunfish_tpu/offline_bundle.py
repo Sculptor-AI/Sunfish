@@ -414,6 +414,12 @@ def _verify_wheelhouse_matches_lock(
         if name in observed:
             raise ValueError(f"wheelhouse contains duplicate distribution: {name}")
         observed[name] = version
+    # The resolved lock intentionally omits bootstrap distributions (see
+    # write_resolved_lock), but the resolver may still ship their wheels when a
+    # runtime package declares e.g. setuptools as a dependency. The installed-
+    # environment audit applies the same exemption.
+    for bootstrap in _BOOTSTRAP_DISTRIBUTIONS:
+        observed.pop(bootstrap, None)
     if observed != distributions:
         missing = sorted(set(distributions) - set(observed))
         extra = sorted(set(observed) - set(distributions))
