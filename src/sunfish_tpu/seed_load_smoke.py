@@ -185,6 +185,7 @@ def run_seed_load_smoke(
 
     from sunfish_tpu.orbax_seed import (
         AUDITED_TARGET_TEXT_PARAMETERS_32E,
+        OFFICIAL_JAX_TREE_TEXT_DELTA,
         _target_abstract_params,
         _tree_signature,
         require_parameter_count,
@@ -262,7 +263,10 @@ def run_seed_load_smoke(
     signature = _tree_signature(restored, flax)
     require_parameter_count(
         signature,
-        expected=AUDITED_TARGET_TEXT_PARAMETERS_32E,
+        # The exact-tree seed derives from the official JAX checkpoint, which
+        # carries OFFICIAL_JAX_TREE_TEXT_DELTA (-30) versus the safetensors
+        # contract — same reconciliation the materializer's own gates apply.
+        expected=AUDITED_TARGET_TEXT_PARAMETERS_32E + OFFICIAL_JAX_TREE_TEXT_DELTA,
         label="Stage-0.5 real sharded seed",
     )
     global_bytes = sum(
