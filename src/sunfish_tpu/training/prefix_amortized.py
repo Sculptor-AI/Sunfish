@@ -173,18 +173,43 @@ class PrefixAmortizedSFTDiffusion(nn.Module):
         # This must be Linen's lifted transform rather than raw ``jax.vmap``:
         # the target is a bound Module with parameter and intermediates
         # collections. Parameters are shared across draws while captured
-        # intermediates acquire a draw axis. XLA can consequently fold K into
+        # intermediates are debug-only passive state, not part of the
+        # loss/grad path, so they do not need their own draw axis; keeping
+        # them unmapped (None) avoids forcing every intermediate capture to
+        # carry a K-sized leading axis. XLA can consequently fold K into
         # the effective batch instead of materializing K Python model calls.
-        first_pass = nn.vmap(
-            lambda module, draw_x, draw_t: decode_draw(
-                module, draw_x, draw_t
-            ),
-            variable_axes={"params": None, "intermediates": 0},
-            split_rngs={"params": False},
-            in_axes=(0, 0),
-            out_axes=0,
-            axis_size=self.noise_draws,
-        )(self.gemma_network, xt, times)
+        #
+        # With exactly one noise draw, vmapping over that axis is
+        # mathematically a no-op (a size-1 batch dimension), but Gemma4's
+        # MoE expert routing calls jax.lax.ragged_dot with the expert
+        # weights (a *shared*, unmapped parameter) as one operand. JAX's
+        # ragged_dot batching rule requires every operand -- including the
+        # unmapped weights -- to carry batch dim 0, so it raises
+        # ``NotImplementedError: ragged_dot vmap over any dim but 0 - NYI``
+        # for *any* vmap over this layer, independent of draw count or
+        # backend (see jax._src.lax.lax._ragged_dot_batch_unpack_dims).
+        # Bypass the vmap entirely for the draws==1 case by calling
+        # decode_draw directly on the squeezed draw axis, then reintroduce
+        # a size-1 leading axis so downstream shapes are identical to what
+        # nn.vmap(..., axis_size=1) would have produced. This is an exact,
+        # mechanical no-op-vmap bypass -- it changes no math -- and defers
+        # the draws>1 ragged_dot limitation, which the smoke/readiness
+        # configs never exercise (noise_draws is pinned to 1 there).
+        if self.noise_draws == 1:
+            first_pass = jax.tree.map(
+                lambda value: value[None], decode_draw(self.gemma_network, xt[0], times[0])
+            )
+        else:
+            first_pass = nn.vmap(
+                lambda module, draw_x, draw_t: decode_draw(
+                    module, draw_x, draw_t
+                ),
+                variable_axes={"params": None, "intermediates": None},
+                split_rngs={"params": False},
+                in_axes=(0, 0),
+                out_axes=0,
+                axis_size=self.noise_draws,
+            )(self.gemma_network, xt, times)
         converted_first = jax.vmap(
             lambda prediction, draw_x, draw_t: self.corruption_process.convert_predictions(
                 prediction, draw_x, draw_t
@@ -199,16 +224,24 @@ class PrefixAmortizedSFTDiffusion(nn.Module):
             (self.noise_draws, batch_size) + (1,) * (sc_logits.ndim - 2)
         )
         sc_logits = jnp.where(do_self_condition, sc_logits, jnp.zeros_like(sc_logits))
-        denoiser_output = nn.vmap(
-            lambda module, draw_x, draw_t, draw_sc: decode_draw(
-                module, draw_x, draw_t, draw_sc
-            ),
-            variable_axes={"params": None, "intermediates": 0},
-            split_rngs={"params": False},
-            in_axes=(0, 0, 0),
-            out_axes=0,
-            axis_size=self.noise_draws,
-        )(self.gemma_network, xt, times, sc_logits)
+        # See the draws==1 fast path and its rationale above the first
+        # nn.vmap call; the same ragged_dot/vmap limitation applies here.
+        if self.noise_draws == 1:
+            denoiser_output = jax.tree.map(
+                lambda value: value[None],
+                decode_draw(self.gemma_network, xt[0], times[0], sc_logits[0]),
+            )
+        else:
+            denoiser_output = nn.vmap(
+                lambda module, draw_x, draw_t, draw_sc: decode_draw(
+                    module, draw_x, draw_t, draw_sc
+                ),
+                variable_axes={"params": None, "intermediates": None},
+                split_rngs={"params": False},
+                in_axes=(0, 0, 0),
+                out_axes=0,
+                axis_size=self.noise_draws,
+            )(self.gemma_network, xt, times, sc_logits)
         converted = jax.vmap(
             lambda prediction, draw_x, draw_t: self.corruption_process.convert_predictions(
                 prediction, draw_x, draw_t

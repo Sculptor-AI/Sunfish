@@ -65,6 +65,7 @@ SOURCE_CONTRACTS: dict[str, tuple[str, str]] = {
     "gemma_moe": ("gemma", "gemma/gm/nn/gemma4/_moe.py"),
     "gemma_layers": ("gemma", "gemma/gm/nn/gemma4/_layers.py"),
     "gemma_modules": ("gemma", "gemma/gm/nn/gemma4/_modules.py"),
+    "etils_array_spec": ("etils", "etils/enp/array_spec.py"),
 }
 
 _OFFICIAL_CHECKPOINT = (
@@ -154,6 +155,26 @@ def _keyword_literal(call: ast.Call, name: str) -> Any:
         return ast.literal_eval(keyword.value)
     except (ValueError, TypeError):
         return None
+
+
+def _dotted_name(node: ast.AST) -> str:
+    """Render ``a.b.c`` for a Name/Attribute chain; best-effort otherwise."""
+    parts: list[str] = []
+    current = node
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if isinstance(current, ast.Name):
+        parts.append(current.id)
+    return ".".join(reversed(parts))
+
+
+def _attribute_chains(tree: ast.AST) -> list[str]:
+    return [
+        _dotted_name(node)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+    ]
 
 
 def _keyword_is_name(call: ast.Call, keyword: str, name: str) -> bool:
@@ -545,6 +566,36 @@ def audit_source_texts(
         _find_class(tree("gemma_layers"), "RMSNorm") is not None
         and _find_class(tree("gemma_modules"), "FeedForward") is not None,
         "gemma4 RMSNorm and FeedForward",
+    )
+
+    # etils reports version 1.14.0 both before and after the upstream fix for
+    # https://github.com/google/etils -- the PyPI release and the patched git
+    # commit (de6d7b24cece82cd49ccf1d8a5558001dcf01830) both self-report
+    # "1.14.0", so `version:etils` above cannot detect a regression to the
+    # broken release. The broken release accessed a private, since-renamed
+    # jax._src.prng attribute from ArraySpec.from_array to detect PRNG-key
+    # arrays, raising `AttributeError: module 'jax._src' has no attribute
+    # 'prng'` under jax 0.10.2. The fixed source uses the public
+    # jax.dtypes.prng_key API instead. Audit the actual source shape so a
+    # silent downgrade (e.g. a bundle rebuilt without --force-reinstall, or a
+    # wheelhouse accidentally shipping both the PyPI and git wheels) fails
+    # closed here rather than surfacing as a mid-training AttributeError
+    # after JAX/backend initialization.
+    array_spec_tree = tree("etils_array_spec")
+    from_array = _find_function(array_spec_tree, "from_array", class_name="ArraySpec")
+    from_array_chains = _attribute_chains(from_array) if from_array is not None else []
+    etils_prng_ok = bool(from_array_chains) and (
+        any(chain.endswith("dtypes.prng_key") for chain in from_array_chains)
+        and not any(
+            chain == "_src.prng" or chain.endswith(".prng") and "_src" in chain
+            for chain in from_array_chains
+        )
+    )
+    _add(
+        checks,
+        "etils:public-prng-key-api",
+        etils_prng_ok,
+        json.dumps(sorted(set(from_array_chains)), sort_keys=True),
     )
 
     passed = bool(checks) and all(check["status"] == "pass" for check in checks)

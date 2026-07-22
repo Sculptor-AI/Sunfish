@@ -1,0 +1,9 @@
+# Connected bundle-builder/off-TPU compute input only; never read on a TPU
+# worker. Upstream etils 1.14.0 on PyPI calls the private, since-renamed
+# jax._src.prng attribute from ArraySpec.from_array, raising
+# `AttributeError: module 'jax._src' has no attribute 'prng'` under jax
+# 0.10.2. This exact upstream commit uses the public jax.dtypes.prng_key
+# API instead and still self-reports version 1.14.0 (the version string
+# was never bumped), so a plain version-pinned install cannot distinguish
+# the fix from the break -- it must be wheeled from this exact commit.
+etils[epath-gcs] @ git+https://github.com/google/etils@de6d7b24cece82cd49ccf1d8a5558001dcf01830

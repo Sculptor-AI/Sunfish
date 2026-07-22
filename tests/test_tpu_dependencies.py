@@ -6,6 +6,7 @@ import tomllib
 import unittest
 
 from sunfish_tpu.training.dependencies import (
+    ETILS_SOURCE_COMMIT,
     GEMMA_SOURCE_COMMIT,
     RUNTIME_VERSIONS,
     TPU_ONLY_RUNTIME_VERSIONS,
@@ -209,8 +210,16 @@ class TpuDependencyLockTests(unittest.TestCase):
                 continue
             if " @ " in line:
                 name, source = line.split(" @ ", 1)
-                pins[name] = "4.1.0"
-                self.assertTrue(source.endswith(GEMMA_SOURCE_COMMIT))
+                name = name.split("[", 1)[0]
+                if name == "gemma":
+                    pins[name] = "4.1.0"
+                    self.assertTrue(source.endswith(GEMMA_SOURCE_COMMIT))
+                elif name == "etils":
+                    # The patched etils git commit still self-reports 1.14.0.
+                    pins[name] = "1.14.0"
+                    self.assertTrue(source.endswith(ETILS_SOURCE_COMMIT))
+                else:
+                    self.fail(f"unexpected git-pinned dependency: {name}")
             else:
                 requirement_name, version = line.split("==", 1)
                 name = requirement_name.split("[", 1)[0]

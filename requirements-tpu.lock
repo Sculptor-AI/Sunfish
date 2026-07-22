@@ -8,7 +8,7 @@
 # saves `pip freeze` for the complete transitive environment on every run.
 
 dialog==1.1.0
-etils[epath-gcs]==1.14.0
+etils[epath-gcs] @ git+https://github.com/google/etils@de6d7b24cece82cd49ccf1d8a5558001dcf01830
 flax==0.12.7
 gemma @ git+https://github.com/google-deepmind/gemma.git@09e7b48ae88720f6236b8266c7213eb51bb62b87
 google-cloud-storage==3.12.1

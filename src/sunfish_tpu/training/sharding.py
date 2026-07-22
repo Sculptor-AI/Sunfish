@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 from typing import Any
 
 import jax
@@ -61,6 +62,25 @@ class PhaseBTreeSharding:
         return jax.tree.unflatten(treedef, shardings)
 
 
+
+def _dev_run_requires_sharded_params() -> bool:
+    """CPU/GPU dev runs (``sunfish-train --allow-non-tpu``) simulate many
+    devices as separate host-memory buffers rather than separate chips with
+    independent HBM. A production TPU pod replicates params for the
+    smoke/router/lora phases safely because each of the N chips has its own
+    HBM; on a single CPU host that same replication multiplies host RAM
+    usage by N, which routinely exceeds the box. Reuse the already-approved
+    Phase-B path/shape-aware sharding for params/opt_state in that dev-only
+    case -- it is the same mechanism Phase.FULL already relies on in
+    production, so it changes memory layout only, never the math any
+    forward/backward pass computes. Production TPU behavior for every phase
+    is unchanged: this only activates when SUNFISH_ALLOW_NON_TPU=1, which
+    ``sunfish-train`` never sets except via the documented CPU/GPU
+    development fallback.
+    """
+    return os.environ.get("SUNFISH_ALLOW_NON_TPU") == "1"
+
+
 def make_training_sharding(config: HarnessConfig) -> SunfishShardingStrategy:
     """Build the approved Phase-A or Phase-B policy after distributed init."""
     devices = sorted(
@@ -80,7 +100,7 @@ def make_training_sharding(config: HarnessConfig) -> SunfishShardingStrategy:
     batch_axes = axis_names[0] if len(axis_names) == 1 else tuple(axis_names)
     batch = NamedSharding(mesh, P(batch_axes))
 
-    if config.run.phase is Phase.FULL:
+    if config.run.phase is Phase.FULL or _dev_run_requires_sharded_params():
         tree_policy = PhaseBTreeSharding(mesh=mesh, data_axis_size=data_axis_size)
         params: Any = tree_policy
         opt_state: Any = tree_policy
@@ -118,7 +138,7 @@ def make_training_sharding_for(
     batch_axes: str | tuple[str, ...]
     batch_axes = axis_names[0] if len(axis_names) == 1 else tuple(axis_names)
     batch = NamedSharding(mesh, P(batch_axes))
-    if resolved_phase is Phase.FULL:
+    if resolved_phase is Phase.FULL or _dev_run_requires_sharded_params():
         tree_policy = PhaseBTreeSharding(mesh=mesh, data_axis_size=data_axis_size)
         params: Any = tree_policy
         opt_state: Any = tree_policy

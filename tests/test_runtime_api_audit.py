@@ -13,6 +13,14 @@ class StandardCheckpointer:
     pass
 """,
             "orbax_atomicity": "COMMIT_SUCCESS_FILE = 'commit_success.txt'\n",
+            "etils_array_spec": """
+class ArraySpec:
+  @classmethod
+  def from_array(cls, array):
+    if lazy.has_jax and jax.dtypes.issubdtype(array.dtype, jax.dtypes.prng_key):
+      return cls(shape=array.shape, dtype='prng_key')
+    return cls(shape=array.shape, dtype=array.dtype)
+""",
             "orbax_checkpoint_manager": """
 @dataclasses.dataclass
 class CheckpointManagerOptions:

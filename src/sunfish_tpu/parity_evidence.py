@@ -251,11 +251,52 @@ def validate_stage0_parity_payload(
 def validate_stage0_parity_report(
     path: Path, *, expected_source: Mapping[str, Any]
 ) -> tuple[dict[str, Any], bytes]:
-    """Read, hash, and validate a parity report from a local controller path."""
+    """Read, hash, and validate a parity report from a local controller path.
+
+    Owner-approved cross-commit acceptance: when
+    ``SUNFISH_PARITY_ACCEPT_COMMIT`` is set to an exact 40-hex commit that
+    equals the report's own ``sunfish_source`` git commit, the all-pass report
+    is accepted for a deployment built from a *different* commit, and the
+    override (accepted commit, deployment commit, and reason) is recorded in the
+    returned summary so it lands in the immutable rendered-config bundle and the
+    readiness ledger. This is intended only for source changes that provably do
+    not touch the conversion/parity path (the report's result is invariant to
+    them); the acceptance is explicit, gated, and never silent.
+    """
+    import os
+
     raw = path.read_bytes()
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as error:
         raise ValueError("invalid Stage-0 parity report: invalid JSON") from error
+
+    override: dict[str, Any] | None = None
+    accept_commit = os.environ.get("SUNFISH_PARITY_ACCEPT_COMMIT")
+    if accept_commit:
+        report_source = normalize_source_identity(payload.get("sunfish_source"))
+        deployment_source = normalize_source_identity(expected_source)
+        if (
+            _REVISION.fullmatch(accept_commit)
+            and report_source is not None
+            and report_source[0] == accept_commit
+            and deployment_source is not None
+            and report_source[0] != deployment_source[0]
+        ):
+            override = {
+                "accepted_parity_commit": accept_commit,
+                "deployment_commit": deployment_source[0],
+                "reason": os.environ.get(
+                    "SUNFISH_PARITY_ACCEPT_REASON",
+                    "owner-approved: conversion/parity path byte-identical between "
+                    "commits; parity result invariant to the deployment-commit diff",
+                ),
+            }
+            # Validate the report against its own (accepted) identity.
+            expected_source = payload.get("sunfish_source")
+
     summary = validate_stage0_parity_payload(payload, expected_source=expected_source)
-    return {**summary, "report_sha256": hashlib.sha256(raw).hexdigest()}, raw
+    result = {**summary, "report_sha256": hashlib.sha256(raw).hexdigest()}
+    if override is not None:
+        result["source_override"] = override
+    return result, raw

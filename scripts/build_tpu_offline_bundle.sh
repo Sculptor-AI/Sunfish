@@ -112,6 +112,22 @@ done
   --wheel-dir "${wheelhouse}" \
   --no-deps \
   --requirement requirements-gemma-source.lock
+# PyPI etils 1.14.0 calls a private jax._src.prng attribute jax 0.10.2 no
+# longer exposes; this exact upstream commit fixes it without bumping the
+# version string, so it must be wheeled from source like Gemma rather than
+# pinned by version (see requirements-etils-source.lock). A plain
+# `pip install` of this commit into an environment that already has PyPI
+# 1.14.0 installed no-ops because pip sees the version requirement as already
+# satisfied; --force-reinstall is required in that ad hoc case. It is not
+# needed here: requirements-tpu-base.lock no longer downloads a PyPI etils
+# wheel at all, so this is the only etils wheel that ever reaches the
+# wheelhouse, and the later --no-index installs (bootstrap_tpu.sh,
+# verify_tpu_bundled_runtime.sh --install) always build a brand-new venv with
+# no prior etils installed to conflict with.
+"${PYTHON_BIN}" -m pip wheel \
+  --wheel-dir "${wheelhouse}" \
+  --no-deps \
+  --requirement requirements-etils-source.lock
 "${PYTHON_BIN}" -m pip wheel \
   --wheel-dir "${wheelhouse}" \
   --no-deps \

@@ -1,10 +1,11 @@
 # Connected bundle-builder input only; TPU workers never read this resolver
 # lock. The builder downloads wheels, then emits a URL-free fully resolved
 # offline lock. Gemma is built separately because unreleased 4.1.0 declares a
-# floating Hackable Diffusion git dependency.
+# floating Hackable Diffusion git dependency. etils is built separately (see
+# requirements-etils-source.lock) because the PyPI 1.14.0 release calls a
+# private jax._src.prng attribute jax 0.10.2 no longer has.
 
 dialog==1.1.0
-etils[epath-gcs]==1.14.0
 flax==0.12.7
 google-cloud-storage==3.12.1
 grain==0.2.18
