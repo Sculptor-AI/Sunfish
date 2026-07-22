@@ -63,22 +63,27 @@ class PhaseBTreeSharding:
 
 
 
-def _dev_run_requires_sharded_params() -> bool:
-    """CPU/GPU dev runs (``sunfish-train --allow-non-tpu``) simulate many
-    devices as separate host-memory buffers rather than separate chips with
-    independent HBM. A production TPU pod replicates params for the
-    smoke/router/lora phases safely because each of the N chips has its own
-    HBM; on a single CPU host that same replication multiplies host RAM
-    usage by N, which routinely exceeds the box. Reuse the already-approved
-    Phase-B path/shape-aware sharding for params/opt_state in that dev-only
-    case -- it is the same mechanism Phase.FULL already relies on in
-    production, so it changes memory layout only, never the math any
-    forward/backward pass computes. Production TPU behavior for every phase
-    is unchanged: this only activates when SUNFISH_ALLOW_NON_TPU=1, which
-    ``sunfish-train`` never sets except via the documented CPU/GPU
-    development fallback.
+def _requires_sharded_params(resolved_phase: Phase) -> bool:
+    """Params/opt_state must be path/shape-sharded (PhaseBTreeSharding) rather
+    than replicated for every phase.
+
+    Phase.FULL always sharded. The readiness/adapter phases (SMOKE/ROUTER/LORA)
+    were originally replicated on the assumption that each v4 chip's 32GB HBM
+    holds the full 16.2GB bf16 base with room to spare; the first real gate-4
+    training smoke on v4-64 disproved that -- the replicated base plus the
+    bidirectional diffusion forward's activations exhaust HBM (device buffer
+    OOM, ~8MB free). Sharding params along the phase mesh (experts+dense under
+    Phase.FULL's mesh, or FSDP along the data axis under the readiness 1-D
+    mesh) drops per-chip param bytes ~device-count-fold and fits comfortably.
+    This is a memory-layout change only -- identical to the mechanism Phase.FULL
+    already relies on -- and does not alter any value a forward/backward pass
+    computes. CPU/GPU dev runs (SUNFISH_ALLOW_NON_TPU=1) also require it because
+    a single host cannot replicate the base per simulated device.
     """
-    return os.environ.get("SUNFISH_ALLOW_NON_TPU") == "1"
+    return (
+        resolved_phase in {Phase.SMOKE, Phase.ROUTER, Phase.LORA}
+        or os.environ.get("SUNFISH_ALLOW_NON_TPU") == "1"
+    )
 
 
 def make_training_sharding(config: HarnessConfig) -> SunfishShardingStrategy:
@@ -100,7 +105,7 @@ def make_training_sharding(config: HarnessConfig) -> SunfishShardingStrategy:
     batch_axes = axis_names[0] if len(axis_names) == 1 else tuple(axis_names)
     batch = NamedSharding(mesh, P(batch_axes))
 
-    if config.run.phase is Phase.FULL or _dev_run_requires_sharded_params():
+    if config.run.phase is Phase.FULL or _requires_sharded_params(config.run.phase):
         tree_policy = PhaseBTreeSharding(mesh=mesh, data_axis_size=data_axis_size)
         params: Any = tree_policy
         opt_state: Any = tree_policy
@@ -138,7 +143,7 @@ def make_training_sharding_for(
     batch_axes: str | tuple[str, ...]
     batch_axes = axis_names[0] if len(axis_names) == 1 else tuple(axis_names)
     batch = NamedSharding(mesh, P(batch_axes))
-    if resolved_phase is Phase.FULL or _dev_run_requires_sharded_params():
+    if resolved_phase is Phase.FULL or _requires_sharded_params(resolved_phase):
         tree_policy = PhaseBTreeSharding(mesh=mesh, data_axis_size=data_axis_size)
         params: Any = tree_policy
         opt_state: Any = tree_policy
